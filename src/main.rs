@@ -2,7 +2,16 @@ mod password;
 
 use eframe::{egui, App, Frame, NativeOptions};
 use eframe::CreationContext;
+use egui::{Color32, RichText};
+
 use password::generate_password;
+
+#[derive(Clone)]
+struct VaultEntry {
+    website: String,
+    username: String,
+    password: String,
+}
 
 fn main() -> eframe::Result<()> {
     let native_options = NativeOptions::default();
@@ -10,6 +19,7 @@ fn main() -> eframe::Result<()> {
         "QuickPass",
         native_options,
         Box::new(|_cc: &CreationContext| {
+            // Keep OK wrapper if your eframe version expects a Result
             Ok(Box::new(QuickPassApp::default()))
         }),
     )
@@ -30,6 +40,15 @@ struct QuickPassApp {
 
     // Generated password
     generated_password: String,
+
+    // Pattern lock fields
+    pattern_attempt: Vec<(usize, usize)>,
+    is_pattern_unlock: bool,
+
+    // Vault
+    vault: Vec<VaultEntry>,
+    new_website: String,
+    new_username: String,
 }
 
 impl Default for QuickPassApp {
@@ -43,6 +62,15 @@ impl Default for QuickPassApp {
             use_digits: true,
             use_symbols: true,
             generated_password: String::new(),
+
+            // Pattern lock defaults
+            pattern_attempt: Vec::new(),
+            is_pattern_unlock: false,
+
+            // Vault defaults
+            vault: Vec::new(),
+            new_website: String::new(),
+            new_username: String::new(),
         }
     }
 }
@@ -62,8 +90,11 @@ impl App for QuickPassApp {
 impl QuickPassApp {
     /// Login screen
     fn show_login_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Welcome to QuickPass");
-        ui.label("Enter your master password:");
+        // Heading
+        ui.heading(RichText::new("Welcome to QuickPass").size(30.0).color(Color32::GRAY));
+
+        // Label
+        ui.label(RichText::new("Enter your master password:").size(20.0).color(Color32::GRAY));
 
         ui.add(egui::TextEdit::singleline(&mut self.master_password_input).password(true));
 
@@ -74,11 +105,79 @@ impl QuickPassApp {
                 self.master_password_input.clear();
             }
         }
+
+        // Pattern lock circles under the master password
+        ui.separator();
+        ui.label(
+            RichText::new("Pattern Lock").size(20.0).color(Color32::GRAY),
+        );
+
+        // Show the pattern lock grid
+        self.show_pattern_lock(ui);
+
+        // If they've completed the pattern, show an option to enter
+        if self.is_pattern_unlock {
+            ui.colored_label(Color32::GREEN, "Pattern unlocked!");
+            if ui.button("Enter with Pattern").clicked() {
+                self.is_logged_in = true;
+            }
+        } else {
+            ui.colored_label(Color32::RED, "Pattern locked");
+        }
+
+        // Reset attempt
+        if ui.button("Reset Pattern").clicked() {
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+        }
     }
 
-    /// Mmain password-gen
+    /// Pattern lock that looks like a 3x3 grid of circles
+    fn show_pattern_lock(&mut self, ui: &mut egui::Ui) {
+        // Hardcoded "correct" pattern for demo
+        let correct_pattern: Vec<(usize, usize)> = vec![(0, 0), (0, 1), (1, 1), (2, 2)];
+
+        // We'll do a 3x3 grid of clickable "circles"
+        for row in 0..3 {
+            ui.horizontal(|ui| {
+                for col in 0..3 {
+                    // CHECK IF (row, col) IS ALREADY CLICKED:
+                    let already_clicked = self.pattern_attempt.contains(&(row, col));
+
+                    // If clicked, color circle differently (e.g., RED); else dark blue
+                    let circle_color = if already_clicked {
+                        Color32::RED
+                    } else {
+                        Color32::DARK_BLUE
+                    };
+
+                    let circle_label = egui::Button::new(
+                        RichText::new("●")
+                            .size(40.0)
+                            .color(circle_color),
+                    )
+                    .frame(false);
+
+                    if ui.add(circle_label).clicked() {
+                        // Record this attempt
+                        self.pattern_attempt.push((row, col));
+
+                        // Check if user completed correct pattern
+                        if self.pattern_attempt == correct_pattern {
+                            self.is_pattern_unlock = true;
+                        } else if self.pattern_attempt.len() >= correct_pattern.len() {
+                            // If they overshoot, reset
+                            self.pattern_attempt.clear();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Main password generation
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("QuickPass Password Generator");
+        ui.heading(RichText::new("QuickPass Password Value").size(30.0).color(Color32::GRAY));
 
         // Slider for length
         ui.horizontal(|ui| {
@@ -104,8 +203,12 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        ui.label("Generated Password:");
+        ui.label(RichText::new("Generated Password:").size(16.0));
         ui.monospace(&self.generated_password);
+
+        ui.separator();
+        // Show vault after we generate or at any time
+        self.show_vault_ui(ui);
 
         ui.separator();
         // A simple logout button
@@ -113,6 +216,46 @@ impl QuickPassApp {
             self.is_logged_in = false;
             self.master_password_input.clear();
             self.generated_password.clear();
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+        }
+    }
+
+    /// Vault UI (minimal approach)
+    fn show_vault_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Vault").size(20.0).color(Color32::DARK_GRAY));
+
+        ui.horizontal(|ui| {
+            ui.label("Website:");
+            ui.text_edit_singleline(&mut self.new_website);
+
+            ui.label("Username:");
+            ui.text_edit_singleline(&mut self.new_username);
+
+            if ui.button("Add to Vault").clicked() {
+                let new_entry = VaultEntry {
+                    website: self.new_website.clone(),
+                    username: self.new_username.clone(),
+                    password: self.generated_password.clone(),
+                };
+                self.vault.push(new_entry);
+
+                // Clear fields
+                self.new_website.clear();
+                self.new_username.clear();
+                self.generated_password.clear();
+            }
+        });
+
+        ui.separator();
+        for (i, entry) in self.vault.iter().enumerate() {
+            ui.group(|ui| {
+                ui.label(format!("Entry #{}", i + 1));
+                ui.label(format!("Website: {}", entry.website));
+                ui.label(format!("Username: {}", entry.username));
+                ui.label(format!("Password: {}", entry.password));
+            });
+            ui.separator();
         }
     }
 }
