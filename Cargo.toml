@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 rand = "0.9.0"
+eframe = "0.31.1"
+egui = "0.31.1"
