@@ -21,7 +21,7 @@ use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use rand::RngCore; 
+use rand::RngCore;
 use password::generate_password;
 
 // ----------------------
@@ -44,20 +44,24 @@ struct VaultEntry {
     password: String,
 }
 
-/// The on-disk format includes two encryptions of the same `vault_key`:
+/// The on-disk format now includes two encryptions of the same `vault_key`:
 #[derive(Serialize, Deserialize)]
 struct EncryptedVaultFile {
+    // Argon2-Hashed credentials
     master_hash: String,
     pattern_hash: Option<String>,
 
+    // The vault key, encrypted with the text-based password:
     encrypted_key_pw: Vec<u8>,
-    nonce_pw: Vec<u8>,
+    nonce_pw: Vec<u8>, // 12-byte random nonce
 
+    // The same vault key, encrypted with the pattern-based key:
     encrypted_key_pt: Option<Vec<u8>>,
-    nonce_pt: Option<Vec<u8>>,
+    nonce_pt: Option<Vec<u8>>, // 12-byte random nonce
 
+    // Finally, the actual vault data:
     vault_ciphertext: Vec<u8>,
-    vault_nonce: Vec<u8>,
+    vault_nonce: Vec<u8>, // random nonce for vault
 }
 
 /// Main application state
@@ -220,7 +224,6 @@ impl QuickPassApp {
                         self.master_password_input = self.first_run_password.clone();
 
                         // We now need to load the vault_key so we can do changes later
-                        // The easiest way is to re-load from disk:
                         if let Ok((_, _, vault_key)) = load_vault_key_only(
                             &self.first_run_password, 
                             Some(pattern_hash.as_bytes())
@@ -243,12 +246,13 @@ impl QuickPassApp {
 
         if ui.button("Login").clicked() {
             let pass = self.master_password_input.clone();
+
+            // FIX: we do load_vault_key_only(...) -> load_vault_data(...) -> THEN store the key
             match load_vault_key_only(&pass, None) {
                 Ok((mh, ph, key)) => {
-                    // FIRST use `key` to load vault data
+                    // Decrypt the vault data first:
                     match load_vault_data(&key) {
                         Ok(vault) => {
-                            // THEN move key into `current_vault_key`
                             self.current_vault_key = Some(key);
                             self.master_hash = Some(mh);
                             self.pattern_hash = ph;
@@ -266,7 +270,7 @@ impl QuickPassApp {
                     self.master_password_input.clear();
                 }
             }
-            
+        }
 
         ui.separator();
         ui.label(RichText::new("Or unlock with your Pattern").size(20.0).color(Color32::GRAY));
@@ -276,6 +280,8 @@ impl QuickPassApp {
             ui.colored_label(Color32::GREEN, "Pattern unlocked!");
             if ui.button("Enter with Pattern").clicked() {
                 let pattern_str = pattern_to_string(&self.pattern_attempt);
+
+                // FIX: load_vault_key_only -> load_vault_data -> THEN store key
                 match load_vault_key_only("", Some(pattern_str.as_bytes())) {
                     Ok((mh, ph, key)) => {
                         match load_vault_data(&key) {
@@ -300,9 +306,15 @@ impl QuickPassApp {
                     }
                 }
             }
+        } else {
+            ui.colored_label(Color32::RED, "Pattern locked");
+        }
+
+        if ui.button("Reset Pattern").clicked() {
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
         }
     }
-
 
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("QuickPass - Vault").size(30.0).color(Color32::GRAY));
@@ -375,8 +387,6 @@ impl QuickPassApp {
         ui.add(egui::TextEdit::singleline(&mut self.new_master_pw).password(true));
 
         if ui.button("Confirm").clicked() {
-            // If we have a vault_key in memory, we can skip verifying the old password
-            // and just re-encrypt the vault_key with the new password, update the file
             if let Some(ref vault_key) = self.current_vault_key {
                 let new_pw = std::mem::take(&mut self.new_master_pw);
 
@@ -540,7 +550,6 @@ impl QuickPassApp {
 // HELPER FUNCTIONS
 // ----------------------------------
 
-/// On first run, we generate the vault_key, encrypt it with text + pattern, etc.
 fn create_new_vault_file(
     master_password: &str,
     pattern_hash_str: &str,
@@ -585,8 +594,7 @@ fn create_new_vault_file(
     Ok((file_data.master_hash.clone(), file_data.pattern_hash.clone().unwrap()))
 }
 
-/// Load just the vault_key (not the entire vault).
-/// If `pattern` is Some(...), we do pattern-based approach, else text-based with `master_password`.
+/// Load just the vault_key
 fn load_vault_key_only(
     master_password: &str,
     pattern: Option<&[u8]>,
@@ -633,7 +641,7 @@ fn load_vault_data(vault_key: &[u8]) -> Result<Vec<VaultEntry>, Box<dyn StdError
     Ok(vault)
 }
 
-/// Save the vault again with the known vault_key
+/// Save the vault with an already-known vault_key
 fn save_vault_file(
     master_hash: &str,
     pattern_hash: Option<&str>,
