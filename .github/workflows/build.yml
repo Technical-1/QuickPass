@@ -74,11 +74,12 @@ jobs:
             -ov
 
       # 8) Notarize the .dmg (capture text with tee), parse ID + status
-      - name: Notarize .dmg
+            - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
-          # Submit and capture entire output
+
+          # Submit for notarization, capturing entire output
           xcrun notarytool submit QuickPass.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
@@ -88,11 +89,11 @@ jobs:
           echo "=== Submission raw output: ==="
           cat notarytool-submit.txt
 
-          # Extract Submission ID from lines like: "Submission ID received\n  id: <UUID>"
-          SUBMISSION_ID=$(grep '^  id:' notarytool-submit.txt | sed 's/.*id: //')
-          echo "Extracted SUBMISSION_ID=$SUBMISSION_ID"
+          # Extract ONLY the first occurrence of "  id:" line
+          SUBMISSION_ID=$(grep '^  id:' notarytool-submit.txt | head -n1 | sed 's/.*id: //')
+          echo "Extracted SUBMISSION_ID=${SUBMISSION_ID}"
 
-          # Check final line for "status: Accepted" or "status: Invalid"
+          # Grab the last status line
           STATUS=$(grep 'status:' notarytool-submit.txt | tail -n1 | sed 's/.*status: //')
           echo "Extracted Notary Status=$STATUS"
 
@@ -100,7 +101,7 @@ jobs:
             echo "Stapling .dmg..."
             xcrun stapler staple QuickPass.dmg
           else
-            echo "Notarization invalid. Fetching logs..."
+            echo "Notarization invalid. Fetching logs with SUBMISSION_ID=${SUBMISSION_ID}..."
             xcrun notarytool log "$SUBMISSION_ID" \
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
@@ -115,6 +116,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
 
       # 9) Upload final .dmg
       - name: Upload notarized .dmg
