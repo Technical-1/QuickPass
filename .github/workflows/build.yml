@@ -69,7 +69,7 @@ jobs:
       - name: Code Sign .dmg
         run: |
           codesign --force --options runtime --deep \
-            --sign "Developer ID Application: Your Name (TEAMID)" \
+            --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             target/release/QuickPass.dmg
 
       # 8) Notarize the .dmg
