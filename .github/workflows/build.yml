@@ -1,19 +1,21 @@
-name: Build and Sign macOS Binary
+name: "Build Rust CLI, wrap in .dmg, Notarize"
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # Or trigger on tags, etc.
+  # Or if you want to auto-release on tags, add:
+  #   tags:
+  #     - 'v*.*.*'
 
 jobs:
-  build-and-sign-macos:
-    name: Build & Sign (macOS)
+  build-macos-dmg:
+    name: "Build, Sign & Notarize macOS (.dmg)"
     runs-on: macos-latest
 
     steps:
-      # 1) Checkout source
+      # 1) Check out code
       - name: Check out code
         uses: actions/checkout@v3
 
@@ -23,40 +25,75 @@ jobs:
         with:
           toolchain: stable
 
-      # 3) Build in release mode
+      # 3) Build CLI in release mode
       - name: Cargo build
         run: cargo build --release
 
-      # 4) Import Developer ID Certificate from p12 stored in GitHub Secrets
+      # 4) Import Developer ID Application certificate
       - name: Install Code Signing Certificate
         run: |
-          # Convert base64-encoded p12 back to binary:
           echo "$APPLE_CERT" | base64 --decode > signing.p12
 
-          # Create a temporary keychain:
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
 
-          # Import the p12
           security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
-
-          # Ensure codesign can access the key without prompting
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
         env:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Code Sign your Rust binary
-      - name: Code Sign
+      # 5) Codesign the CLI binary
+      - name: Code Sign CLI
         run: |
           codesign --deep --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             target/release/QuickPass
 
-      # 7) Upload artifact
-      - name: Upload signed artifact
+      # 6) Create a .dmg containing the signed CLI
+      - name: Create .dmg
+        run: |
+          cd target/release
+
+          # Create a folder to hold the CLI (optionally add a README)
+          mkdir QuickPassDmgContent
+          cp QuickPass QuickPassDmgContent/
+
+          hdiutil create QuickPass.dmg \
+            -volname "QuickPass" \
+            -srcfolder "QuickPassDmgContent" \
+            -ov
+
+      # 7) Code sign the .dmg itself
+      - name: Code Sign .dmg
+        run: |
+          codesign --force --options runtime --deep \
+            --sign "Developer ID Application: Your Name (TEAMID)" \
+            target/release/QuickPass.dmg
+
+      # 8) Notarize the .dmg
+      - name: Notarize .dmg
+        if: env.APPLE_APP_SPECIFIC_PASSWORD
+        run: |
+          cd target/release
+          xcrun notarytool submit QuickPass.dmg \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+          # Staple the .dmg
+          xcrun stapler staple QuickPass.dmg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+      # 9) Upload final .dmg artifact
+      - name: Upload notarized .dmg
         uses: actions/upload-artifact@v4
         with:
-          name: QuickPass-signed
-          path: target/release/QuickPass
+          name: QuickPass-macOS-dmg
+          path: target/release/QuickPass.dmg
+          overwrite: true
