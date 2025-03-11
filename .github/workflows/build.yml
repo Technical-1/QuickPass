@@ -52,8 +52,11 @@ jobs:
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Copy the Info.plist from your repo into the .app
+          # Copy the Info.plist from your repo
           cp .github/workflows/Info.plist QuickPass.app/Contents/Info.plist
+
+          # Create the Resources folder and copy icon.icns
+          mkdir -p QuickPass.app/Contents/Resources
           cp .github/workflows/icon.icns QuickPass.app/Contents/Resources/icon.icns
 
       # 6) Code sign .app (no --deep)
