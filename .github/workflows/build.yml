@@ -33,30 +33,28 @@ jobs:
       - name: Install Code Signing Certificate
         run: |
           echo "$APPLE_CERT" | base64 --decode > signing.p12
-
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
-
           security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
         env:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Create .app folder + Info.plist
+      # 5) Create .app folder + Info.plist (all in one line)
       - name: Create .app bundle
         run: |
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Minimal Info.plist with CFBundleIdentifier
+          # Minimal Info.plist in one line
           echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\<plist version=\"1.0\">\n\<dict>\n\  <key>CFBundleIdentifier</key>\n\  <string>com.KANFER.QuickPass</string>\n\  <key>CFBundlePackageType</key>\n\ <string>APPL</string>\n\ <key>CFBundleName</key>\n\  <string>QuickPass</string>\n\  <key>CFBundleShortVersionString</key>\n\  <string>1.0</string>\n\  <key>CFBundleVersion</key>\n\  <string>1</string>\n\</dict>\n\</plist>\n" > QuickPass.app/Contents/Info.plist
-
 
       # 6) Code sign only the .app
       - name: Code Sign .app
         run: |
+          # Omitting --deep to avoid potential mismatch
           codesign --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
@@ -64,10 +62,8 @@ jobs:
       # 7) Make .dmg with HFS+ (skip code signing the .dmg)
       - name: Create .dmg
         run: |
-          # Move .app into target/release
           mv QuickPass.app target/release/
           cd target/release
-
           mkdir QuickPassDmgContent
           mv QuickPass.app QuickPassDmgContent/
 
@@ -78,19 +74,46 @@ jobs:
             -fs HFS+ \
             -ov
 
-      # 8) Notarize the .dmg with primary-bundle-id
+      # 8) Notarize the .dmg, fetch logs if invalid
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
+
+          # Submit for notarization, capturing output to JSON
           xcrun notarytool submit QuickPass.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
+            --wait \
+            --output notary-output.json || true
 
-          # After success, staple the .dmg
-          xcrun stapler staple QuickPass.dmg
+          echo "Submission response JSON:"
+          cat notary-output.json
+
+          # Use 'jq' to parse out status + id
+          STATUS=$(jq -r '.status' notary-output.json)
+          SUBMISSION_ID=$(jq -r '.id' notary-output.json)
+
+          echo "Notary status: $STATUS"
+          echo "Submission ID: $SUBMISSION_ID"
+
+          # If 'Accepted', staple. Otherwise, fetch logs + fail
+          if [ "$STATUS" = "Accepted" ]; then
+            echo "Stapling .dmg"
+            xcrun stapler staple QuickPass.dmg
+          else
+            echo "Notarization invalid. Fetching logs..."
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --output detailed-log.json
+
+            echo "Detailed Notary Log:"
+            cat detailed-log.json
+            exit 1
+          fi
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
