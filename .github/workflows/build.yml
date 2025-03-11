@@ -54,28 +54,6 @@ jobs:
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             target/release/QuickPass
 
-      # 6) (Optional) Notarize + staple
-      - name: Notarize
-        if: env.APPLE_APP_SPECIFIC_PASSWORD
-        run: |
-          # Zip the signed binary
-          cd target/release
-          zip QuickPass.zip QuickPass
-
-          # Submit to Apple Notary
-          xcrun notarytool submit QuickPass.zip \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
-
-          # Staple the ticket
-          xcrun stapler staple QuickPass
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-
       # 7) Upload artifact
       - name: Upload signed artifact
         uses: actions/upload-artifact@v4
