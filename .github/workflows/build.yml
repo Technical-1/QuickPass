@@ -50,8 +50,7 @@ jobs:
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Print entire Info.plist in one line, using \n for newlines:
-          printf "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+          echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n\
 <dict>\n\
@@ -65,8 +64,6 @@ jobs:
   <string>1</string>\n\
 </dict>\n\
 </plist>\n" > QuickPass.app/Contents/Info.plist
-
-
 
       # 6) Code sign the .app
       - name: Code Sign .app
