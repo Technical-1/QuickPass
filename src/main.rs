@@ -28,7 +28,6 @@ use password::generate_password;
 // ----------------------
 // Constants / Globals
 // ----------------------
-
 static GLOBAL_SALT: OnceLock<SaltString> = OnceLock::new();
 
 fn global_salt() -> &'static SaltString {
@@ -45,7 +44,7 @@ struct VaultEntry {
     password: String,
 }
 
-/// The on-disk format includes two encryptions of the same `vault_key`:
+/// The on-disk format now includes two encryptions of the same `vault_key`:
 #[derive(Serialize, Deserialize)]
 struct EncryptedVaultFile {
     // Argon2-Hashed credentials
@@ -54,15 +53,15 @@ struct EncryptedVaultFile {
 
     // The vault key, encrypted with the text-based password:
     encrypted_key_pw: Vec<u8>,
-    nonce_pw: Vec<u8>, // 12-byte random nonce
+    nonce_pw: Vec<u8>,
 
     // The same vault key, encrypted with the pattern-based key:
     encrypted_key_pt: Option<Vec<u8>>,
-    nonce_pt: Option<Vec<u8>>, // 12-byte random nonce
+    nonce_pt: Option<Vec<u8>>,
 
     // Finally, the actual vault data:
     vault_ciphertext: Vec<u8>,
-    vault_nonce: Vec<u8>, // random nonce for vault
+    vault_nonce: Vec<u8>,
 }
 
 /// Main application state
@@ -110,9 +109,8 @@ struct QuickPassApp {
     first_run_pattern: Vec<(usize, usize)>,
     first_run_pattern_unlocked: bool,
 
-    // track failed login attempts
+    // Vault delete after 3 fails
     failed_attempts: u32,
-    // UI error message to show after failures
     login_error_msg: String,
 }
 
@@ -122,8 +120,8 @@ impl Default for QuickPassApp {
             is_logged_in: false,
             vault: Vec::new(),
             file_exists: vault_file_path().exists(),
-
             current_vault_key: None,
+
             master_password_input: String::new(),
             pattern_attempt: Vec::new(),
             is_pattern_unlock: false,
@@ -152,7 +150,6 @@ impl Default for QuickPassApp {
             first_run_pattern: Vec::new(),
             first_run_pattern_unlocked: false,
 
-            // NEW
             failed_attempts: 0,
             login_error_msg: String::new(),
         }
@@ -177,7 +174,6 @@ fn main() -> eframe::Result<()> {
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Display any login error message
             if !self.login_error_msg.is_empty() {
                 ui.colored_label(Color32::RED, &self.login_error_msg);
             }
@@ -212,13 +208,13 @@ impl QuickPassApp {
         ui.add(egui::TextEdit::singleline(&mut self.first_run_password).password(true));
 
         ui.separator();
-        ui.label("Create a Pattern (click 4+ circles):");
-        self.show_pattern_lock_first_run(ui);
+        ui.label("Create a Pattern (need at least 8 clicks on a 6×6 grid):");
+        self.show_pattern_lock_first_run(ui); // 6×6 grid
 
         if self.first_run_pattern_unlocked {
             ui.colored_label(Color32::GREEN, "Pattern set!");
         } else {
-            ui.colored_label(Color32::RED, "Pattern not set (need >=4).");
+            ui.colored_label(Color32::RED, "Pattern not set (need >=8).");
         }
 
         ui.separator();
@@ -226,7 +222,7 @@ impl QuickPassApp {
             if self.first_run_password.is_empty() {
                 self.login_error_msg = "Please type a master password!".into();
             } else if !self.first_run_pattern_unlocked {
-                self.login_error_msg = "Please create a pattern (4+ clicks)!".into();
+                self.login_error_msg = "Please create a pattern (8+ clicks)!".into();
             } else {
                 let pattern_hash = hash_pattern(&self.first_run_pattern);
                 match create_new_vault_file(&self.first_run_password, &pattern_hash) {
@@ -241,7 +237,7 @@ impl QuickPassApp {
 
                         // Load vault key
                         if let Ok((_, _, vault_key)) = load_vault_key_only(
-                            &self.first_run_password, 
+                            &self.first_run_password,
                             Some(pattern_hash.as_bytes())
                         ) {
                             self.current_vault_key = Some(vault_key);
@@ -263,10 +259,8 @@ impl QuickPassApp {
         if ui.button("Login").clicked() {
             let pass = self.master_password_input.clone();
 
-            // Attempt text password login
             match load_vault_key_only(&pass, None) {
                 Ok((mh, ph, key)) => {
-                    // Decrypt the vault data first:
                     match load_vault_data(&key) {
                         Ok(vault) => {
                             self.current_vault_key = Some(key);
@@ -289,13 +283,11 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        ui.label(RichText::new("Or unlock with your Pattern").size(20.0).color(Color32::GRAY));
+        ui.label(RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)").size(20.0).color(Color32::GRAY));
         self.show_pattern_lock_login(ui);
 
         if self.is_pattern_unlock {
-            ui.colored_label(Color32::GREEN, "Pattern unlocked!");
             if ui.button("Enter with Pattern").clicked() {
-                // Attempt pattern login
                 let pattern_str = pattern_to_string(&self.pattern_attempt);
                 match load_vault_key_only("", Some(pattern_str.as_bytes())) {
                     Ok((mh, ph, key)) => {
@@ -375,7 +367,6 @@ impl QuickPassApp {
 
         ui.separator();
         if ui.button("Logout").clicked() {
-            // Re-encrypt + save the vault if we have a vault_key
             if let Some(ref vault_key) = self.current_vault_key {
                 if let Some(mh) = &self.master_hash {
                     if let Err(e) = save_vault_file(mh, self.pattern_hash.as_deref(), vault_key, &self.vault) {
@@ -436,19 +427,20 @@ impl QuickPassApp {
     }
 
     fn show_change_pattern_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Change Pattern");
-        ui.label("Create a new pattern (4+ clicks):");
+        ui.heading("Change Pattern (6×6 grid)");
+        ui.label("Create a new pattern (need at least 8 clicks).");
 
-        if self.new_pattern_attempt.len() >= 4 {
+        if self.new_pattern_attempt.len() >= 8 {
             self.new_pattern_unlocked = true;
         }
 
-        for row in 0..3 {
+        // 6×6 grid
+        for row in 0..6 {
             ui.horizontal(|ui| {
-                for col in 0..3 {
+                for col in 0..6 {
                     let clicked = self.new_pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-                    let btn = egui::Button::new(RichText::new("●").size(40.0).color(clr)).frame(false);
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add(btn).clicked() {
                         self.new_pattern_attempt.push((row, col));
                     }
@@ -459,17 +451,13 @@ impl QuickPassApp {
         if self.new_pattern_unlocked {
             ui.colored_label(Color32::GREEN, "New pattern set!");
         } else {
-            ui.colored_label(Color32::RED, "Not enough clicks yet.");
+            ui.colored_label(Color32::RED, "Not enough clicks yet (need >=8).");
         }
 
         if ui.button("Confirm Pattern").clicked() {
             if let Some(ref vault_key) = self.current_vault_key {
                 let new_pat_str = pattern_to_string(&self.new_pattern_attempt);
-                match update_pattern_with_key(
-                    &new_pat_str,
-                    vault_key,
-                    &self.vault
-                ) {
+                match update_pattern_with_key(&new_pat_str, vault_key, &self.vault) {
                     Ok(np) => {
                         self.pattern_hash = Some(np);
                         eprintln!("Pattern changed successfully!");
@@ -479,7 +467,6 @@ impl QuickPassApp {
             } else {
                 eprintln!("No vault_key in memory, can't change pattern!");
             }
-
             self.show_change_pattern = false;
         }
 
@@ -526,16 +513,17 @@ impl QuickPassApp {
         }
     }
 
+    // 6×6 for first run, must have >=8 to unlock
     fn show_pattern_lock_first_run(&mut self, ui: &mut egui::Ui) {
-        if self.first_run_pattern.len() >= 4 {
+        if self.first_run_pattern.len() >= 8 {
             self.first_run_pattern_unlocked = true;
         }
-        for row in 0..3 {
+        for row in 0..6 {
             ui.horizontal(|ui| {
-                for col in 0..3 {
+                for col in 0..6 {
                     let clicked = self.first_run_pattern.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-                    let btn = egui::Button::new(RichText::new("●").size(40.0).color(clr)).frame(false);
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add(btn).clicked() {
                         self.first_run_pattern.push((row, col));
                     }
@@ -544,16 +532,17 @@ impl QuickPassApp {
         }
     }
 
+    // 6×6 for login, must have >=8 to unlock
     fn show_pattern_lock_login(&mut self, ui: &mut egui::Ui) {
-        if self.pattern_attempt.len() >= 4 {
+        if self.pattern_attempt.len() >= 8 {
             self.is_pattern_unlock = true;
         }
-        for row in 0..3 {
+        for row in 0..6 {
             ui.horizontal(|ui| {
-                for col in 0..3 {
+                for col in 0..6 {
                     let clicked = self.pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-                    let btn = egui::Button::new(RichText::new("●").size(40.0).color(clr)).frame(false);
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add(btn).clicked() {
                         self.pattern_attempt.push((row, col));
                     }
@@ -562,16 +551,14 @@ impl QuickPassApp {
         }
     }
 
-    // handle login failures
+    // If user fails login, increment attempts or delete the vault if 3 fails
     fn handle_login_failure(&mut self, err_msg: String) {
         self.failed_attempts += 1;
         let attempts_left = 3 - self.failed_attempts;
         if self.failed_attempts >= 3 {
-            // Delete vault + exit
             if vault_file_path().exists() {
                 let _ = fs::remove_file(vault_file_path());
             }
-            // Show final error then exit
             eprintln!("Too many failed attempts! Vault deleted, exiting...");
             process::exit(1);
         } else {
