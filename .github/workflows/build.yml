@@ -5,9 +5,6 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # If you want auto-release on tags, also add:
-  #   tags:
-  #     - 'v*.*.*'
 
 jobs:
   build-macos-dmg:
@@ -44,20 +41,21 @@ jobs:
           # Now import your Developer ID .p12
           security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
 
-          # Ensure codesign can read the private key
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
         env:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Create .app folder + minimal Info.plist (on one line)
+      # 5) Create .app folder and copy Info.plist from the repo
       - name: Create .app bundle
         run: |
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
+
+          # Copy the Info.plist from your repo into the .app
           cp .github/workflows/Info.plist QuickPass.app/Contents/Info.plist
 
-      # 6) Code sign only the .app (no --deep)
+      # 6) Code sign .app (no --deep)
       - name: Code Sign .app
         run: |
           codesign --force --options runtime \
@@ -86,12 +84,11 @@ jobs:
             -fs HFS+ \
             -ov
 
-      # 9) Notarize the .dmg, capturing logs if "Invalid"
+      # 9) Notarize the .dmg, capturing logs
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
-          # Submit for notarization, capturing entire output
           xcrun notarytool submit QuickPass.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
@@ -101,11 +98,9 @@ jobs:
           echo "=== Submission raw output: ==="
           cat notarytool-submit.txt
 
-          # Extract ONLY the first occurrence of "  id:" line
           SUBMISSION_ID=$(grep '^  id:' notarytool-submit.txt | head -n1 | sed 's/.*id: //')
           echo "Extracted SUBMISSION_ID=${SUBMISSION_ID}"
 
-          # Grab the last status line
           STATUS=$(grep 'status:' notarytool-submit.txt | tail -n1 | sed 's/.*status: //')
           echo "Extracted Notary Status=$STATUS"
 
