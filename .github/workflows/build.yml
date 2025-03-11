@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # 1) Check out
+      # 1) Check out code
       - name: Check out code
         uses: actions/checkout@v3
 
@@ -25,30 +25,38 @@ jobs:
         with:
           toolchain: stable
 
-      # 3) Build CLI
+      # 3) Build CLI in release mode
       - name: Cargo build
         run: cargo build --release
 
-      # 4) Import Developer ID certificate
+      # 4) Import Developer ID certificate + AppleWWDRCAG3 intermediate
       - name: Install Code Signing Certificate
         run: |
           echo "$APPLE_CERT" | base64 --decode > signing.p12
           security create-keychain -p "" build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
+
+          # Download & import Apple WWDR intermediate certificate
+          curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import AppleWWDRCAG3.cer -k build.keychain
+
+          # Now import your Developer ID .p12
           security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
+
+          # Ensure codesign can read the private key
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
         env:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Create .app folder + Info.plist (all in one line)
+      # 5) Create .app folder + minimal Info.plist (on one line)
       - name: Create .app bundle
         run: |
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Minimal Info.plist on one line
+          # Minimal Info.plist as one line
           echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\<plist version=\"1.0\">\n\<dict>\n\  <key>CFBundleIdentifier</key>\n\  <string>com.KANFER.QuickPass</string>\n\  <key>CFBundlePackageType</key>\n\ <string>APPL</string>\n\ <key>CFBundleName</key>\n\  <string>QuickPass</string>\n\  <key>CFBundleShortVersionString</key>\n\  <string>1.0</string>\n\  <key>CFBundleVersion</key>\n\  <string>1</string>\n\</dict>\n\</plist>\n" > QuickPass.app/Contents/Info.plist
 
       # 6) Code sign only the .app (no --deep)
@@ -58,7 +66,15 @@ jobs:
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
 
-      # 7) Make .dmg with HFS+ (skip code signing the .dmg)
+      # 7) Debug-check the signed .app
+      - name: Debug Signed .app
+        run: |
+          echo "=== codesign -dv --verbose=4 ==="
+          codesign -dv --verbose=4 QuickPass.app
+          echo "=== spctl -a -vvv QuickPass.app ==="
+          spctl -a -vvv QuickPass.app || true
+
+      # 8) Make .dmg using HFS+ (skip code signing the .dmg)
       - name: Create .dmg
         run: |
           mv QuickPass.app target/release/
@@ -66,19 +82,17 @@ jobs:
           mkdir QuickPassDmgContent
           mv QuickPass.app QuickPassDmgContent/
 
-          # Create .dmg using HFS+ filesystem
           hdiutil create QuickPass.dmg \
             -volname "QuickPass" \
             -srcfolder "QuickPassDmgContent" \
             -fs HFS+ \
             -ov
 
-      # 8) Notarize the .dmg (capture text with tee), parse ID + status
+      # 9) Notarize the .dmg, capturing logs if "Invalid"
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
-
           # Submit for notarization, capturing entire output
           xcrun notarytool submit QuickPass.dmg \
             --apple-id "$APPLE_ID" \
@@ -117,8 +131,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
 
-
-      # 9) Upload final .dmg
+      # 10) Upload final .dmg
       - name: Upload notarized .dmg
         uses: actions/upload-artifact@v4
         with:
