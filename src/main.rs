@@ -507,6 +507,7 @@ impl QuickPassApp {
         // Remove spacing so in-between squares can't be clicked
         let original_spacing = ui.spacing().clone();
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
 
         // 6×6 grid
         for row in 0..6 {
@@ -514,8 +515,9 @@ impl QuickPassApp {
                 for col in 0..6 {
                     let clicked = self.new_pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-                    // fix button size so no space in between
+
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.new_pattern_attempt.push((row, col));
                     }
@@ -600,13 +602,16 @@ impl QuickPassApp {
         // remove spacing
         let original_spacing = ui.spacing().clone();
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
 
         for row in 0..6 {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.first_run_pattern.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
+
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.first_run_pattern.push((row, col));
                     }
