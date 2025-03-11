@@ -162,12 +162,11 @@ jobs:
           overwrite: true
 
   # ------------------------------------------------
-  # (3) Release Job
+  # 3) Release job
   # ------------------------------------------------
   release:
-    name: "Create GitHub Release"
+    needs: [build-windows-linux, build-macos-dmg]
     runs-on: ubuntu-latest
-    needs: [ build-windows-linux, build-macos-dmg ]
 
     steps:
       - name: Download Windows
@@ -182,17 +181,19 @@ jobs:
           name: QuickPass-Linux
           path: ./dist
 
-      - name: Download macOS dmg
+      - name: Download mac dmg
         uses: actions/download-artifact@v4
         with:
           name: QuickPass-macOS-dmg
           path: ./dist
 
+      # Provide GITHUB_TOKEN via env, not 'token:' input
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ github.ref_name }}
           release_name: ${{ github.ref_name }}
           draft: false
