@@ -51,7 +51,7 @@ jobs:
       - name: Code Sign
         run: |
           codesign --deep --force --options runtime \
-            --sign "Developer ID Application: Your Name (TEAMID)" \
+            --sign "Developer ID Application: Your Name ($APPLE_TEAM_ID)" \
             target/release/QuickPass
         # REPLACE "Your Name (TEAMID)" exactly with your certificate name from Keychain Access
 
