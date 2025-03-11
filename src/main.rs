@@ -208,7 +208,6 @@ fn vault_file_path() -> PathBuf {
         data_dir.join("encrypted_vault.json")
     } else {
         // Fallback if we can't get a project dir
-        // Just store in current dir (not recommended)
         PathBuf::from("encrypted_vault.json")
     }
 }

@@ -54,7 +54,7 @@ jobs:
 
           # Copy the Info.plist from your repo into the .app
           cp .github/workflows/Info.plist QuickPass.app/Contents/Info.plist
-          cp .github/workflows/icon.icns QuickPass.app/Contents/icon.icns
+          cp .github/workflows/icon.icns QuickPass.app/Contents/Resources/icon.icns
 
       # 6) Code sign .app (no --deep)
       - name: Code Sign .app
