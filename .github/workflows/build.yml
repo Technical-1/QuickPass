@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # If you want to auto-release on tags, also add:
+  # If you want auto-release on tags, also add:
   #   tags:
   #     - 'v*.*.*'
 
@@ -48,13 +48,12 @@ jobs:
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Minimal Info.plist in one line
+          # Minimal Info.plist on one line
           echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\<plist version=\"1.0\">\n\<dict>\n\  <key>CFBundleIdentifier</key>\n\  <string>com.KANFER.QuickPass</string>\n\  <key>CFBundlePackageType</key>\n\ <string>APPL</string>\n\ <key>CFBundleName</key>\n\  <string>QuickPass</string>\n\  <key>CFBundleShortVersionString</key>\n\  <string>1.0</string>\n\  <key>CFBundleVersion</key>\n\  <string>1</string>\n\</dict>\n\</plist>\n" > QuickPass.app/Contents/Info.plist
 
-      # 6) Code sign only the .app
+      # 6) Code sign only the .app (no --deep)
       - name: Code Sign .app
         run: |
-          # Omitting --deep to avoid potential mismatch
           codesign --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
@@ -74,33 +73,31 @@ jobs:
             -fs HFS+ \
             -ov
 
-      # 8) Notarize the .dmg, fetch logs if invalid
+      # 8) Notarize the .dmg (capture text with tee), parse ID + status
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
-
-          # Submit for notarization, capturing output to JSON
+          # Submit and capture entire output
           xcrun notarytool submit QuickPass.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait \
-            --output notary-output.json || true
+            --wait 2>&1 | tee notarytool-submit.txt
 
-          echo "Submission response JSON:"
-          cat notary-output.json
+          echo "=== Submission raw output: ==="
+          cat notarytool-submit.txt
 
-          # Use 'jq' to parse out status + id
-          STATUS=$(jq -r '.status' notary-output.json)
-          SUBMISSION_ID=$(jq -r '.id' notary-output.json)
+          # Extract Submission ID from lines like: "Submission ID received\n  id: <UUID>"
+          SUBMISSION_ID=$(grep '^  id:' notarytool-submit.txt | sed 's/.*id: //')
+          echo "Extracted SUBMISSION_ID=$SUBMISSION_ID"
 
-          echo "Notary status: $STATUS"
-          echo "Submission ID: $SUBMISSION_ID"
+          # Check final line for "status: Accepted" or "status: Invalid"
+          STATUS=$(grep 'status:' notarytool-submit.txt | tail -n1 | sed 's/.*status: //')
+          echo "Extracted Notary Status=$STATUS"
 
-          # If 'Accepted', staple. Otherwise, fetch logs + fail
           if [ "$STATUS" = "Accepted" ]; then
-            echo "Stapling .dmg"
+            echo "Stapling .dmg..."
             xcrun stapler staple QuickPass.dmg
           else
             echo "Notarization invalid. Fetching logs..."
@@ -108,10 +105,10 @@ jobs:
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
               --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-              --output detailed-log.json
+              2>&1 | tee notarytool-log.txt
 
-            echo "Detailed Notary Log:"
-            cat detailed-log.json
+            echo "=== Detailed Notary Log: ==="
+            cat notarytool-log.txt
             exit 1
           fi
         env:
