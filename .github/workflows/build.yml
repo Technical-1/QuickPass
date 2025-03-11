@@ -26,26 +26,36 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      # -------------- Windows --------------
+      # -----------------------------
+      # Windows
+      # -----------------------------
       - name: Upload artifact (Windows)
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          artifact_name: QuickPass-Windows
+          name: QuickPass-Windows
           path: target/release/QuickPass.exe
+          # Overwrite if an artifact with the same name exists (optional)
+          overwrite: true
 
-      # -------------- macOS --------------
+      # -----------------------------
+      # macOS
+      # -----------------------------
       - name: Upload artifact (macOS)
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          artifact_name: QuickPass-macOS
+          name: QuickPass-macOS
           path: target/release/QuickPass
+          overwrite: true
 
-      # -------------- Linux --------------
+      # -----------------------------
+      # Linux
+      # -----------------------------
       - name: Upload artifact (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
-          artifact_name: QuickPass-Linux
+          name: QuickPass-Linux
           path: target/release/QuickPass
+          overwrite: true
