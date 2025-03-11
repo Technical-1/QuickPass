@@ -1,27 +1,26 @@
 mod password;
 
 use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
 };
 use argon2::{
-    Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
 };
 use directories::ProjectDirs;
+use eframe::{egui, App, Frame, NativeOptions};
 use eframe::CreationContext;
-use eframe::{App, Frame, NativeOptions, egui};
 use egui::{Color32, RichText};
 use zeroize::Zeroize;
 
 use serde::{Deserialize, Serialize};
 
+use once_cell::sync::Lazy; // <--- we use Lazy from once_cell
 use std::error::Error as StdError;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
-use std::process;
-use std::sync::OnceLock;
 
 use password::generate_password;
 use rand::RngCore;
@@ -29,10 +28,15 @@ use rand::RngCore;
 // ----------------------
 // Constants / Globals
 // ----------------------
-static GLOBAL_SALT: OnceLock<SaltString> = OnceLock::new();
+
+// Instead of OnceLock, we use once_cell::sync::Lazy:
+static GLOBAL_SALT: Lazy<SaltString> = Lazy::new(|| {
+    // Called once, lazily, to produce our global salt
+    SaltString::encode_b64(b"MY_APP_STATIC_SALT").unwrap()
+});
 
 fn global_salt() -> &'static SaltString {
-    GLOBAL_SALT.get_or_init(|| SaltString::encode_b64(b"MY_APP_STATIC_SALT").unwrap())
+    &GLOBAL_SALT
 }
 
 /// For letting the user pick exactly which symbols to include:
@@ -72,14 +76,19 @@ struct EncryptedVaultFile {
 
 /// Main application state
 struct QuickPassApp {
+    // If true, we show Vault Manager screen
+    show_vault_manager: bool,
+
+    // The name (identifier) of the currently open vault
+    active_vault_name: Option<String>,
+
     is_logged_in: bool,
     vault: Vec<VaultEntry>,
-    file_exists: bool,
 
     // The currently unlocked vault key, if any:
     current_vault_key: Option<Vec<u8>>,
 
-    // Text-based login
+    // Master login input
     master_password_input: String,
 
     // Pattern-based login
@@ -95,40 +104,57 @@ struct QuickPassApp {
     use_lowercase: bool,
     use_uppercase: bool,
     use_digits: bool,
-    // Instead of a single bool, we use a list of toggles
     symbol_toggles: Vec<SymbolToggle>,
 
     generated_password: String,
 
-    // Vault entry temp fields
+    // For adding new vault entries
     new_website: String,
     new_username: String,
 
     // Changing master password
     show_change_pw: bool,
-    new_master_pw: String,
+    new_master_pw_old_input: String,   // old password user must confirm
+    new_master_pw: String,            // new password
 
     // Changing pattern
     show_change_pattern: bool,
+    old_password_for_pattern: String, // must confirm old password
     new_pattern_attempt: Vec<(usize, usize)>,
     new_pattern_unlocked: bool,
 
-    // First-run UI
+    // "Initial Creation" (for newly named vault)
     first_run_password: String,
     first_run_pattern: Vec<(usize, usize)>,
     first_run_pattern_unlocked: bool,
 
-    // Vault delete after 3 fails
+    // login failure tracking
     failed_attempts: u32,
     login_error_msg: String,
+
+    // Editing an existing VaultEntry
+    editing_index: Option<usize>,
+    editing_website: String,
+    editing_username: String,
+    editing_password: String,
+
+    // Password visibility per entry
+    password_visible: Vec<bool>,
+
+    // For the Vault Manager
+    new_vault_name: String,
+    manager_vaults: Vec<String>,
 }
 
 impl Default for QuickPassApp {
     fn default() -> Self {
+        let manager_vaults = scan_vaults_in_dir();
         Self {
+            show_vault_manager: true,
+            active_vault_name: None,
+
             is_logged_in: false,
             vault: Vec::new(),
-            file_exists: vault_file_path().exists(),
             current_vault_key: None,
 
             master_password_input: String::new(),
@@ -142,112 +168,33 @@ impl Default for QuickPassApp {
             use_lowercase: true,
             use_uppercase: true,
             use_digits: true,
-            // Pre-populate some common symbols:
             symbol_toggles: vec![
-                SymbolToggle {
-                    sym: '!',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '@',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '#',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '$',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '%',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '^',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '&',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '*',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '(',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: ')',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '-',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '_',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '=',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '+',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '[',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: ']',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '{',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '}',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: ':',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: ';',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: ',',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '.',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '<',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '>',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '?',
-                    enabled: true,
-                },
-                SymbolToggle {
-                    sym: '/',
-                    enabled: true,
-                },
+                SymbolToggle { sym: '!', enabled: true },
+                SymbolToggle { sym: '@', enabled: true },
+                SymbolToggle { sym: '#', enabled: true },
+                SymbolToggle { sym: '$', enabled: true },
+                SymbolToggle { sym: '%', enabled: true },
+                SymbolToggle { sym: '^', enabled: true },
+                SymbolToggle { sym: '&', enabled: true },
+                SymbolToggle { sym: '*', enabled: true },
+                SymbolToggle { sym: '(', enabled: true },
+                SymbolToggle { sym: ')', enabled: true },
+                SymbolToggle { sym: '-', enabled: true },
+                SymbolToggle { sym: '_', enabled: true },
+                SymbolToggle { sym: '=', enabled: true },
+                SymbolToggle { sym: '+', enabled: true },
+                SymbolToggle { sym: '[', enabled: true },
+                SymbolToggle { sym: ']', enabled: true },
+                SymbolToggle { sym: '{', enabled: true },
+                SymbolToggle { sym: '}', enabled: true },
+                SymbolToggle { sym: ':', enabled: true },
+                SymbolToggle { sym: ';', enabled: true },
+                SymbolToggle { sym: ',', enabled: true },
+                SymbolToggle { sym: '.', enabled: true },
+                SymbolToggle { sym: '<', enabled: true },
+                SymbolToggle { sym: '>', enabled: true },
+                SymbolToggle { sym: '?', enabled: true },
+                SymbolToggle { sym: '/', enabled: true },
             ],
             generated_password: String::new(),
 
@@ -255,9 +202,11 @@ impl Default for QuickPassApp {
             new_username: String::new(),
 
             show_change_pw: false,
+            new_master_pw_old_input: String::new(),
             new_master_pw: String::new(),
 
             show_change_pattern: false,
+            old_password_for_pattern: String::new(),
             new_pattern_attempt: Vec::new(),
             new_pattern_unlocked: false,
 
@@ -267,25 +216,48 @@ impl Default for QuickPassApp {
 
             failed_attempts: 0,
             login_error_msg: String::new(),
+
+            editing_index: None,
+            editing_website: String::new(),
+            editing_username: String::new(),
+            editing_password: String::new(),
+
+            password_visible: Vec::new(),
+
+            new_vault_name: String::new(),
+            manager_vaults,
         }
     }
 }
 
-/// Cross-platform location for "encrypted_vault.json"
-fn vault_file_path() -> PathBuf {
-    // This identifies your app across OSes:
-    //   On macOS: ~/Library/Application Support/QuickPass
-    //   On Windows: C:\Users\<User>\AppData\Roaming\KANFER\QuickPass
-    //   On Linux: ~/.local/share/quickpass
+fn data_dir() -> PathBuf {
     if let Some(proj_dirs) = ProjectDirs::from("com", "KANFER", "QuickPass") {
-        let data_dir = proj_dirs.data_dir();
-        // Ensure the directory exists
-        let _ = fs::create_dir_all(data_dir);
-        data_dir.join("encrypted_vault.json")
+        let dir = proj_dirs.data_dir();
+        let _ = fs::create_dir_all(dir);
+        dir.to_path_buf()
     } else {
-        // Fallback if we can't get a project dir
-        PathBuf::from("encrypted_vault.json")
+        PathBuf::from(".")
     }
+}
+
+fn vault_file_path(vault_name: &str) -> PathBuf {
+    data_dir().join(format!("encrypted_vault_{vault_name}.json"))
+}
+
+/// Scans data_dir for files named "encrypted_vault_*.json"
+fn scan_vaults_in_dir() -> Vec<String> {
+    let mut results = Vec::new();
+    if let Ok(entries) = fs::read_dir(data_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
+            if fname.starts_with("encrypted_vault_") && fname.ends_with(".json") {
+                let middle = &fname["encrypted_vault_".len()..fname.len() - ".json".len()];
+                results.push(middle.to_string());
+            }
+        }
+    }
+    results
 }
 
 fn main() -> eframe::Result<()> {
@@ -293,11 +265,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "QuickPass",
         native_options,
-        Box::new(|_cc: &CreationContext| Ok(Box::new(QuickPassApp::default()))),
+        Box::new(|_cc: &CreationContext| {
+            Ok(Box::new(QuickPassApp::default()))
+        }),
     )
 }
 
-// eframe App Implementation
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -305,8 +278,21 @@ impl App for QuickPassApp {
                 ui.colored_label(Color32::RED, &self.login_error_msg);
             }
 
-            if !self.file_exists && !self.is_logged_in {
-                self.show_first_run_ui(ui);
+            if self.show_vault_manager {
+                self.show_vault_manager_ui(ui);
+                return;
+            }
+
+            if self.active_vault_name.is_none() {
+                self.show_vault_manager = true;
+                return;
+            }
+            let vault_name = self.active_vault_name.as_ref().unwrap();
+            let path = vault_file_path(vault_name);
+            let file_exists = path.exists();
+
+            if !file_exists && !self.is_logged_in {
+                self.show_initial_creation_ui(ui);
             } else if !self.is_logged_in {
                 self.show_login_ui(ui);
             } else {
@@ -326,14 +312,78 @@ impl App for QuickPassApp {
 // UI Scenes
 // ----------------------------------
 impl QuickPassApp {
-    // --------------- FIRST RUN UI ---------------
-    fn show_first_run_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            RichText::new("First time opened!")
-                .size(28.0)
-                .color(Color32::RED),
-        );
-        ui.label("You must set BOTH a master password AND a pattern.");
+    // Vault Manager
+    fn show_vault_manager_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Vault Manager").size(28.0).color(Color32::YELLOW));
+        ui.label("Manage multiple vaults below.");
+
+        ui.separator();
+
+        if !self.manager_vaults.is_empty() {
+            ui.label("Existing vaults:");
+            let vault_list = self.manager_vaults.clone();
+            for vault_name in vault_list {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Vault: {}", vault_name));
+                    if ui.button("Open").clicked() {
+                        self.active_vault_name = Some(vault_name.clone());
+                        self.show_vault_manager = false;
+                        self.login_error_msg.clear();
+                        self.vault.clear();
+                        self.password_visible.clear();
+                        self.is_logged_in = false;
+                        self.master_password_input.clear();
+                        self.pattern_attempt.clear();
+                        self.is_pattern_unlock = false;
+                        self.failed_attempts = 0;
+                    }
+                    if ui.button("Delete").clicked() {
+                        let path = vault_file_path(&vault_name);
+                        let _ = fs::remove_file(path);
+                        // re-scan
+                        self.manager_vaults = scan_vaults_in_dir();
+                    }
+                });
+            }
+        } else {
+            ui.colored_label(Color32::RED, "No vault files found yet.");
+        }
+
+        ui.separator();
+        // Create new vault
+        ui.heading("Create a brand-new vault");
+        ui.label("Vault Name:");
+        ui.text_edit_singleline(&mut self.new_vault_name);
+
+        if ui.button("Create").clicked() {
+            if self.new_vault_name.trim().is_empty() {
+                self.login_error_msg = "Please enter a vault name!".into();
+            } else {
+                let path = vault_file_path(&self.new_vault_name);
+                if path.exists() {
+                    self.login_error_msg = "Vault with that name already exists!".into();
+                } else {
+                    self.active_vault_name = Some(self.new_vault_name.clone());
+                    self.show_vault_manager = false;
+                    self.login_error_msg.clear();
+                    self.vault.clear();
+                    self.password_visible.clear();
+                    self.is_logged_in = false;
+                    self.master_password_input.clear();
+                    self.pattern_attempt.clear();
+                    self.is_pattern_unlock = false;
+                    self.failed_attempts = 0;
+                }
+            }
+        }
+    }
+
+    fn show_initial_creation_ui(&mut self, ui: &mut egui::Ui) {
+        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+        ui.heading(RichText::new(format!("Initial Creation for: {}", vault_name))
+            .size(28.0)
+            .color(Color32::RED));
+        ui.label("You must set BOTH a master password AND a pattern for this new vault.");
 
         ui.separator();
         ui.label("Master Password:");
@@ -356,24 +406,29 @@ impl QuickPassApp {
             } else if !self.first_run_pattern_unlocked {
                 self.login_error_msg = "Please create a pattern (8+ clicks)!".into();
             } else {
-                let pattern_hash = hash_pattern(&self.first_run_pattern);
-                match create_new_vault_file(&self.first_run_password, &pattern_hash) {
+                let pattern_hash = pattern_to_string(&self.first_run_pattern);
+                let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                match create_new_vault_file(
+                    &vault_name,
+                    &self.first_run_password,
+                    &pattern_hash,
+                ) {
                     Ok((mh, ph)) => {
                         self.master_hash = Some(mh);
                         self.pattern_hash = Some(ph);
                         self.vault.clear();
-                        self.file_exists = true;
+                        self.password_visible.clear();
+
                         self.is_logged_in = true;
                         self.master_password_input = self.first_run_password.clone();
                         self.login_error_msg.clear();
 
-                        // Load vault key
-                        if let Ok((_, _, vault_key)) = load_vault_key_only(
-                            &self.first_run_password,
-                            Some(pattern_hash.as_bytes()),
-                        ) {
+                        if let Ok((_, _, vault_key)) =
+                            load_vault_key_only(&vault_name, &self.first_run_password, Some(pattern_hash.as_bytes()))
+                        {
                             self.current_vault_key = Some(vault_key);
                         }
+                        self.manager_vaults = scan_vaults_in_dir();
                     }
                     Err(e) => {
                         self.login_error_msg = format!("Failed first-run vault: {e}");
@@ -383,26 +438,24 @@ impl QuickPassApp {
         }
     }
 
-    // --------------- LOGIN UI ---------------
     fn show_login_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            RichText::new("Welcome Back to QuickPass")
-                .size(30.0)
-                .color(Color32::GRAY),
-        );
+        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+        ui.heading(RichText::new(format!("Welcome to: {}", vault_name))
+            .size(30.0)
+            .color(Color32::GRAY));
         ui.label("Enter your master password:");
         ui.add(egui::TextEdit::singleline(&mut self.master_password_input).password(true));
 
         if ui.button("Login").clicked() {
             let pass = self.master_password_input.clone();
-
-            match load_vault_key_only(&pass, None) {
-                Ok((mh, ph, key)) => match load_vault_data(&key) {
+            match load_vault_key_only(&vault_name, &pass, None) {
+                Ok((mh, ph, key)) => match load_vault_data(&vault_name, &key) {
                     Ok(vault) => {
                         self.current_vault_key = Some(key);
                         self.master_hash = Some(mh);
                         self.pattern_hash = ph;
                         self.vault = vault;
+                        self.password_visible = vec![false; self.vault.len()];
                         self.is_logged_in = true;
                         self.login_error_msg.clear();
                         self.failed_attempts = 0;
@@ -418,23 +471,21 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        ui.label(
-            RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)")
-                .size(20.0)
-                .color(Color32::GRAY),
-        );
+        ui.label(RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)").size(20.0).color(Color32::GRAY));
         self.show_pattern_lock_login(ui);
 
         if self.is_pattern_unlock {
             if ui.button("Enter with Pattern").clicked() {
                 let pattern_str = pattern_to_string(&self.pattern_attempt);
-                match load_vault_key_only("", Some(pattern_str.as_bytes())) {
-                    Ok((mh, ph, key)) => match load_vault_data(&key) {
+                let name = self.active_vault_name.clone().unwrap_or_default();
+                match load_vault_key_only(&name, "", Some(pattern_str.as_bytes())) {
+                    Ok((mh, ph, key)) => match load_vault_data(&name, &key) {
                         Ok(vault) => {
                             self.current_vault_key = Some(key);
                             self.master_hash = Some(mh);
                             self.pattern_hash = ph;
                             self.vault = vault;
+                            self.password_visible = vec![false; self.vault.len()];
                             self.is_logged_in = true;
                             self.login_error_msg.clear();
                             self.failed_attempts = 0;
@@ -462,17 +513,28 @@ impl QuickPassApp {
             self.pattern_attempt.clear();
             self.is_pattern_unlock = false;
         }
+
+        ui.separator();
+        if ui.button("Return to Vault Manager").clicked() {
+            self.show_vault_manager = true;
+            // Clear state
+            self.active_vault_name = None;
+            self.is_logged_in = false;
+            self.vault.clear();
+            self.password_visible.clear();
+            self.master_password_input.clear();
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+            self.login_error_msg.clear();
+            self.failed_attempts = 0;
+        }
     }
 
-    // --------------- MAIN UI ---------------
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            RichText::new("QuickPass - Vault")
-                .size(30.0)
-                .color(Color32::GRAY),
-        );
+        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+        ui.heading(RichText::new(format!("QuickPass - Vault: {}", vault_name))
+            .size(30.0).color(Color32::GRAY));
 
-        // Sliders/checkboxes for password generation
         ui.horizontal(|ui| {
             ui.label("Length:");
             ui.add(egui::Slider::new(&mut self.length, 1..=128).text("characters"));
@@ -481,7 +543,6 @@ impl QuickPassApp {
         ui.checkbox(&mut self.use_uppercase, "Uppercase (A-Z)");
         ui.checkbox(&mut self.use_digits, "Digits (0-9)");
 
-        // Symbol toggles
         ui.separator();
         ui.label("Select which symbols to include:");
         let original_spacing = ui.spacing().clone();
@@ -497,7 +558,6 @@ impl QuickPassApp {
             });
         *ui.spacing_mut() = original_spacing;
 
-        // Generate button
         if ui.button("Generate Password").clicked() {
             let user_symbols = self.collect_enabled_symbols();
             self.generated_password = generate_password(
@@ -519,11 +579,14 @@ impl QuickPassApp {
         ui.separator();
         if ui.button("Change Master Password").clicked() {
             self.show_change_pw = true;
+            self.new_master_pw_old_input.clear();
+            self.new_master_pw.clear();
         }
 
         ui.separator();
         if ui.button("Change Pattern").clicked() {
             self.show_change_pattern = true;
+            self.old_password_for_pattern.clear();
             self.new_pattern_attempt.clear();
             self.new_pattern_unlocked = false;
         }
@@ -532,29 +595,33 @@ impl QuickPassApp {
         if ui.button("Logout").clicked() {
             if let Some(ref vault_key) = self.current_vault_key {
                 if let Some(mh) = &self.master_hash {
-                    if let Err(e) =
-                        save_vault_file(mh, self.pattern_hash.as_deref(), vault_key, &self.vault)
-                    {
+                    let name = self.active_vault_name.clone().unwrap_or_default();
+                    if let Err(e) = save_vault_file(&name, mh, self.pattern_hash.as_deref(), vault_key, &self.vault) {
                         eprintln!("Failed to save on logout: {e}");
                     }
                 }
             }
 
-            self.master_password_input.clear();
+            // Return to manager
+            self.show_vault_manager = true;
+            self.active_vault_name = None;
             self.is_logged_in = false;
-            self.generated_password.clear();
+            self.vault.clear();
+            self.password_visible.clear();
+            self.master_password_input.clear();
             self.pattern_attempt.clear();
             self.is_pattern_unlock = false;
             self.show_change_pw = false;
+            self.new_master_pw_old_input.clear();
             self.new_master_pw.clear();
             self.show_change_pattern = false;
+            self.old_password_for_pattern.clear();
             self.new_pattern_attempt.clear();
             self.new_pattern_unlocked = false;
             self.current_vault_key = None;
         }
     }
 
-    /// Collect user-enabled symbols into a Vec<char>.
     fn collect_enabled_symbols(&self) -> Vec<char> {
         self.symbol_toggles
             .iter()
@@ -563,49 +630,176 @@ impl QuickPassApp {
             .collect()
     }
 
-    // --------------- CHANGE MASTER PASSWORD UI ---------------
+    fn show_vault_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Vault Entries").size(20.0).color(Color32::DARK_GRAY));
+
+        ui.horizontal(|ui| {
+            ui.label("Website:");
+            ui.text_edit_singleline(&mut self.new_website);
+
+            ui.label("Username:");
+            ui.text_edit_singleline(&mut self.new_username);
+
+            if ui.button("Add to Vault").clicked() {
+                let new_entry = VaultEntry {
+                    website: self.new_website.clone(),
+                    username: self.new_username.clone(),
+                    password: self.generated_password.clone(),
+                };
+                self.vault.push(new_entry);
+                self.password_visible.push(false);
+
+                self.new_website.clear();
+                self.new_username.clear();
+                self.generated_password.clear();
+            }
+        });
+
+        ui.separator();
+        while self.password_visible.len() < self.vault.len() {
+            self.password_visible.push(false);
+        }
+
+        let user_symbols = self.collect_enabled_symbols();
+
+        for i in 0..self.vault.len() {
+            let entry = &mut self.vault[i];
+            ui.group(|ui| {
+                ui.label(format!("Entry #{}", i + 1));
+
+                if self.editing_index == Some(i) {
+                    ui.label("Edit Website:");
+                    ui.text_edit_singleline(&mut self.editing_website);
+
+                    ui.label("Edit Username:");
+                    ui.text_edit_singleline(&mut self.editing_username);
+
+                    ui.label("Edit Password:");
+                    ui.text_edit_singleline(&mut self.editing_password);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            entry.website = self.editing_website.clone();
+                            entry.username = self.editing_username.clone();
+                            entry.password = self.editing_password.clone();
+                            self.editing_index = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.editing_index = None;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Website: {}", entry.website));
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(entry.website.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Username: {}", entry.username));
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(entry.username.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let visible = self.password_visible[i];
+                        let display_str = if visible { &entry.password } else { "***" };
+                        ui.label(format!("Password: {}", display_str));
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(entry.password.clone());
+                        }
+                        let eye_label = if visible { "🙈" } else { "👁" };
+                        if ui.button(eye_label).on_hover_text("Toggle visibility").clicked() {
+                            self.password_visible[i] = !self.password_visible[i];
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Edit").clicked() {
+                            self.editing_index = Some(i);
+                            self.editing_website = entry.website.clone();
+                            self.editing_username = entry.username.clone();
+                            self.editing_password = entry.password.clone();
+                        }
+
+                        if ui.button("↻").on_hover_text("Regenerate Password").clicked() {
+                            let old_len = entry.password.len();
+                            let new_pwd = generate_password(
+                                old_len,
+                                self.use_lowercase,
+                                self.use_uppercase,
+                                self.use_digits,
+                                &user_symbols,
+                            );
+                            entry.password = new_pwd;
+                        }
+                    });
+                }
+            });
+            ui.separator();
+        }
+    }
+
     fn show_change_password_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Change Master Password");
+        ui.heading("Change Master Password (requires old password)");
+        ui.label("Old Password:");
+        ui.add(egui::TextEdit::singleline(&mut self.new_master_pw_old_input).password(true));
+
         ui.label("New Password:");
         ui.add(egui::TextEdit::singleline(&mut self.new_master_pw).password(true));
 
         if ui.button("Confirm").clicked() {
+            let vault_name = self.active_vault_name.clone().unwrap_or_default();
             if let Some(ref vault_key) = self.current_vault_key {
-                let new_pw = std::mem::take(&mut self.new_master_pw);
-
-                match update_master_password_with_key(
-                    &new_pw,
-                    vault_key,
-                    &self.vault,
-                    self.pattern_hash.as_deref(),
-                ) {
-                    Ok(new_hash) => {
-                        eprintln!("Master password changed!");
-                        self.master_hash = Some(new_hash);
-                        self.master_password_input = new_pw;
+                let old_pass = self.new_master_pw_old_input.clone();
+                match load_vault_key_only(&vault_name, &old_pass, None) {
+                    Ok((_, _, _)) => {
+                        let new_pw = std::mem::take(&mut self.new_master_pw);
+                        match update_master_password_with_key(
+                            &vault_name,
+                            &old_pass,
+                            &new_pw,
+                            vault_key,
+                            &self.vault,
+                            self.pattern_hash.as_deref(),
+                        ) {
+                            Ok(new_hash) => {
+                                eprintln!("Master password changed!");
+                                self.master_hash = Some(new_hash);
+                                self.master_password_input = new_pw;
+                                self.login_error_msg.clear();
+                            }
+                            Err(e) => {
+                                eprintln!("Change PW error: {e}");
+                                self.login_error_msg = format!("Failed to change PW: {e}");
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Change PW error: {e}");
+                    Err(_) => {
+                        self.login_error_msg = "Old password incorrect!".into();
                     }
                 }
             } else {
                 eprintln!("No vault key in memory, can't change password!");
             }
-
             self.show_change_pw = false;
         }
 
         if ui.button("Cancel").clicked() {
             self.show_change_pw = false;
+            self.new_master_pw_old_input.clear();
             self.new_master_pw.clear();
         }
     }
 
-    // --------------- CHANGE PATTERN UI ---------------
     fn show_change_pattern_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Change Pattern (6×6 grid)");
-        ui.label("Create a new pattern (need >=8 clicks).");
+        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+        ui.heading("Change Pattern (requires old password)");
+        ui.label("Enter your old master password:");
+        ui.add(egui::TextEdit::singleline(&mut self.old_password_for_pattern).password(true));
 
+        ui.separator();
+        ui.label("Create a new pattern (need >=8 clicks).");
         if self.new_pattern_attempt.len() >= 8 {
             self.new_pattern_unlocked = true;
         }
@@ -618,13 +812,8 @@ impl QuickPassApp {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.new_pattern_attempt.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                    let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.new_pattern_attempt.push((row, col));
                     }
@@ -641,70 +830,41 @@ impl QuickPassApp {
         }
 
         if ui.button("Confirm Pattern").clicked() {
-            if let Some(ref vault_key) = self.current_vault_key {
-                let new_pat_str = pattern_to_string(&self.new_pattern_attempt);
-                match update_pattern_with_key(&new_pat_str, vault_key, &self.vault) {
-                    Ok(np) => {
-                        self.pattern_hash = Some(np);
-                        eprintln!("Pattern changed successfully!");
+            let old_pass = self.old_password_for_pattern.clone();
+            match load_vault_key_only(&vault_name, &old_pass, None) {
+                Ok((_, _, _)) => {
+                    if let Some(ref vault_key) = self.current_vault_key {
+                        let new_pat_str = pattern_to_string(&self.new_pattern_attempt);
+                        match update_pattern_with_key(&vault_name, &old_pass, &new_pat_str, vault_key, &self.vault) {
+                            Ok(np) => {
+                                self.pattern_hash = Some(np);
+                                eprintln!("Pattern changed successfully!");
+                                self.login_error_msg.clear();
+                            }
+                            Err(e) => {
+                                eprintln!("Change pattern error: {e}");
+                                self.login_error_msg = format!("Failed to change pattern: {e}");
+                            }
+                        }
+                    } else {
+                        eprintln!("No vault_key in memory, can't change pattern!");
                     }
-                    Err(e) => eprintln!("Change pattern error: {e}"),
                 }
-            } else {
-                eprintln!("No vault_key in memory, can't change pattern!");
+                Err(_) => {
+                    self.login_error_msg = "Old password incorrect for pattern change!".into();
+                }
             }
             self.show_change_pattern = false;
         }
 
         if ui.button("Cancel").clicked() {
             self.show_change_pattern = false;
+            self.old_password_for_pattern.clear();
             self.new_pattern_attempt.clear();
             self.new_pattern_unlocked = false;
         }
     }
 
-    // --------------- VAULT UI ---------------
-    fn show_vault_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            RichText::new("Vault Entries")
-                .size(20.0)
-                .color(Color32::DARK_GRAY),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Website:");
-            ui.text_edit_singleline(&mut self.new_website);
-
-            ui.label("Username:");
-            ui.text_edit_singleline(&mut self.new_username);
-
-            if ui.button("Add to Vault").clicked() {
-                let new_entry = VaultEntry {
-                    website: self.new_website.clone(),
-                    username: self.new_username.clone(),
-                    password: self.generated_password.clone(),
-                };
-                self.vault.push(new_entry);
-
-                self.new_website.clear();
-                self.new_username.clear();
-                self.generated_password.clear();
-            }
-        });
-
-        ui.separator();
-        for (i, entry) in self.vault.iter().enumerate() {
-            ui.group(|ui| {
-                ui.label(format!("Entry #{}", i + 1));
-                ui.label(format!("Website: {}", entry.website));
-                ui.label(format!("Username: {}", entry.username));
-                ui.label(format!("Password: {}", entry.password));
-            });
-            ui.separator();
-        }
-    }
-
-    // --------------- FIRST-RUN PATTERN (6×6) ---------------
     fn show_pattern_lock_first_run(&mut self, ui: &mut egui::Ui) {
         if self.first_run_pattern.len() >= 8 {
             self.first_run_pattern_unlocked = true;
@@ -718,13 +878,8 @@ impl QuickPassApp {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.first_run_pattern.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                    let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.first_run_pattern.push((row, col));
                     }
@@ -735,7 +890,6 @@ impl QuickPassApp {
         *ui.spacing_mut() = original_spacing;
     }
 
-    // --------------- LOGIN PATTERN (6×6) ---------------
     fn show_pattern_lock_login(&mut self, ui: &mut egui::Ui) {
         if self.pattern_attempt.len() >= 8 {
             self.is_pattern_unlock = true;
@@ -748,13 +902,8 @@ impl QuickPassApp {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.pattern_attempt.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                    let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
+                    let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.pattern_attempt.push((row, col));
                     }
@@ -765,21 +914,28 @@ impl QuickPassApp {
         *ui.spacing_mut() = original_spacing;
     }
 
-    // --------------- FAILED ATTEMPTS ---------------
     fn handle_login_failure(&mut self, err_msg: String) {
         self.failed_attempts += 1;
         let attempts_left = 3 - self.failed_attempts;
         if self.failed_attempts >= 3 {
-            // Delete vault + exit
-            if vault_file_path().exists() {
-                let _ = fs::remove_file(vault_file_path());
+            let vault_name = self.active_vault_name.clone().unwrap_or_default();
+            let path = vault_file_path(&vault_name);
+            if path.exists() {
+                let _ = fs::remove_file(&path);
             }
-            eprintln!("Too many failed attempts! Vault deleted, exiting...");
-            process::exit(1);
+            eprintln!("Too many failed attempts! Vault deleted, exiting to manager...");
+            self.show_vault_manager = true;
+            self.active_vault_name = None;
+            self.is_logged_in = false;
+            self.vault.clear();
+            self.password_visible.clear();
+            self.master_password_input.clear();
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+            self.failed_attempts = 0;
+            self.login_error_msg = "Vault was deleted after too many failed attempts!".into();
         } else {
-            self.login_error_msg = format!(
-                "{err_msg} - Wrong credentials! You have {attempts_left} attempt(s) left before vault deletion."
-            );
+            self.login_error_msg = format!("{err_msg} - Wrong credentials! {attempts_left} attempts left.");
         }
     }
 }
@@ -788,10 +944,14 @@ impl QuickPassApp {
 // HELPER FUNCTIONS
 // ----------------------------------
 
+/// Create a new vault file
 fn create_new_vault_file(
+    vault_name: &str,
     master_password: &str,
     pattern_hash_str: &str,
 ) -> Result<(String, String), Box<dyn StdError>> {
+    let path = vault_file_path(vault_name);
+
     let argon2 = Argon2::default();
     let salt_str = global_salt();
 
@@ -806,13 +966,10 @@ fn create_new_vault_file(
         .to_string();
 
     let mut vault_key = [0u8; 32];
-    let mut rng = rand::rng();
-    rng.fill_bytes(&mut vault_key);
+    rand::rng().fill_bytes(&mut vault_key);
 
-    let (encrypted_key_pw, nonce_pw) =
-        encrypt_with_derived_key(&vault_key, master_password.as_bytes())?;
-    let (encrypted_key_pt, nonce_pt) =
-        encrypt_with_derived_key(&vault_key, pattern_hash_str.as_bytes())?;
+    let (encrypted_key_pw, nonce_pw) = encrypt_with_derived_key(&vault_key, master_password.as_bytes())?;
+    let (encrypted_key_pt, nonce_pt) = encrypt_with_derived_key(&vault_key, pattern_hash_str.as_bytes())?;
 
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(&[], &vault_key)?;
     vault_key.zeroize();
@@ -829,45 +986,32 @@ fn create_new_vault_file(
     };
 
     let serialized = serde_json::to_string_pretty(&file_data)?;
-    fs::write(vault_file_path(), serialized)?;
+    fs::write(path, serialized)?;
 
-    Ok((
-        file_data.master_hash.clone(),
-        file_data.pattern_hash.clone().unwrap(),
-    ))
+    Ok((file_data.master_hash.clone(), file_data.pattern_hash.clone().unwrap()))
 }
 
-/// Load just the vault_key
 fn load_vault_key_only(
+    vault_name: &str,
     master_password: &str,
     pattern: Option<&[u8]>,
 ) -> Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>> {
-    let data = fs::read_to_string(vault_file_path())?;
+    let path = vault_file_path(vault_name);
+    let data = fs::read_to_string(&path)?;
     let file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
     if let Some(patt_bytes) = pattern {
-        // pattern-based
-        let phash = file
-            .pattern_hash
-            .as_ref()
-            .ok_or("No pattern hash stored!")?;
+        let phash = file.pattern_hash.as_ref().ok_or("No pattern hash stored!")?;
         let parsed_hash = PasswordHash::new(phash).map_err(|e| e.to_string())?;
         Argon2::default()
             .verify_password(patt_bytes, &parsed_hash)
             .map_err(|_| IoError::new(ErrorKind::InvalidData, "Pattern mismatch"))?;
 
-        let enc_key_pt = file
-            .encrypted_key_pt
-            .as_ref()
-            .ok_or("No encrypted_key_pt!")?;
+        let enc_key_pt = file.encrypted_key_pt.as_ref().ok_or("No encrypted_key_pt!")?;
         let nonce_pt = file.nonce_pt.as_ref().ok_or("No nonce_pt!")?;
 
         let vault_key = decrypt_with_derived_key(enc_key_pt, nonce_pt, patt_bytes)?;
-        Ok((
-            file.master_hash.clone(),
-            file.pattern_hash.clone(),
-            vault_key,
-        ))
+        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
     } else {
         // text-based
         if !master_password.is_empty() {
@@ -881,53 +1025,52 @@ fn load_vault_key_only(
             &file.nonce_pw,
             master_password.as_bytes(),
         )?;
-        Ok((
-            file.master_hash.clone(),
-            file.pattern_hash.clone(),
-            vault_key,
-        ))
+        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
     }
 }
 
-/// Once we have the vault_key, we decrypt the vault data
-fn load_vault_data(vault_key: &[u8]) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
-    let data = fs::read_to_string(vault_file_path())?;
+fn load_vault_data(vault_name: &str, vault_key: &[u8]) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+    let path = vault_file_path(vault_name);
+    let data = fs::read_to_string(&path)?;
     let file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
     let vault = decrypt_vault_data((&file.vault_nonce, &file.vault_ciphertext), vault_key)?;
     Ok(vault)
 }
 
-/// Save the vault with an already-known vault_key
 fn save_vault_file(
+    vault_name: &str,
     master_hash: &str,
     pattern_hash: Option<&str>,
     vault_key: &[u8],
     vault: &[VaultEntry],
 ) -> Result<(), Box<dyn StdError>> {
-    let data = fs::read_to_string(vault_file_path())?;
+    let path = vault_file_path(vault_name);
+    let data = fs::read_to_string(&path)?;
     let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
-    // Re-encrypt the vault data with the known vault_key
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
     file.vault_nonce = vault_nonce;
     file.vault_ciphertext = vault_ciphertext;
 
     file.master_hash = master_hash.to_string();
-    file.pattern_hash = pattern_hash.map(str::to_string);
+    file.pattern_hash = pattern_hash.map(|s| s.to_string());
 
     let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(vault_file_path(), serialized)?;
+    fs::write(path, serialized)?;
     Ok(())
 }
 
-/// We have the existing vault_key in memory, so skip verifying old password
 fn update_master_password_with_key(
+    _vault_name: &str,
+    _old_password: &str,
     new_password: &str,
     vault_key: &[u8],
     vault: &[VaultEntry],
     pattern_hash: Option<&str>,
 ) -> Result<String, Box<dyn StdError>> {
+    let path = vault_file_path(_vault_name);
+
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_hash = argon2
@@ -935,15 +1078,10 @@ fn update_master_password_with_key(
         .map_err(|e| e.to_string())?
         .to_string();
 
-    // Re-encrypt the vault_key with new password
-    let (encrypted_key_pw, nonce_pw) =
-        encrypt_with_derived_key(vault_key, new_password.as_bytes())?;
-
-    // Re-encrypt the vault data
+    let (encrypted_key_pw, nonce_pw) = encrypt_with_derived_key(vault_key, new_password.as_bytes())?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
 
-    // Update the file
-    let data = fs::read_to_string(vault_file_path())?;
+    let data = fs::read_to_string(&path)?;
     let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
     file.master_hash = new_hash.clone();
     file.pattern_hash = pattern_hash.map(|s| s.to_string());
@@ -954,16 +1092,19 @@ fn update_master_password_with_key(
     file.vault_ciphertext = vault_ciphertext;
 
     let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(vault_file_path(), serialized)?;
+    fs::write(path, serialized)?;
     Ok(new_hash)
 }
 
-/// We have the existing vault_key in memory, so skip verifying old text password
 fn update_pattern_with_key(
+    _vault_name: &str,
+    _old_password: &str,
     new_pattern_str: &str,
     vault_key: &[u8],
     vault: &[VaultEntry],
 ) -> Result<String, Box<dyn StdError>> {
+    let path = vault_file_path(_vault_name);
+
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_ph = argon2
@@ -971,15 +1112,10 @@ fn update_pattern_with_key(
         .map_err(|e| e.to_string())?
         .to_string();
 
-    // Re-encrypt vault_key with new pattern
-    let (encrypted_key_pt, nonce_pt) =
-        encrypt_with_derived_key(vault_key, new_pattern_str.as_bytes())?;
-
-    // Re-encrypt vault data
+    let (encrypted_key_pt, nonce_pt) = encrypt_with_derived_key(vault_key, new_pattern_str.as_bytes())?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
 
-    // Update file
-    let data = fs::read_to_string(vault_file_path())?;
+    let data = fs::read_to_string(&path)?;
     let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
     file.pattern_hash = Some(new_ph.clone());
@@ -989,15 +1125,11 @@ fn update_pattern_with_key(
     file.vault_ciphertext = vault_ciphertext;
 
     let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(vault_file_path(), serialized)?;
+    fs::write(path, serialized)?;
     Ok(new_ph)
 }
 
-// Pattern strings
-fn hash_pattern(pattern: &[(usize, usize)]) -> String {
-    pattern_to_string(pattern)
-}
-
+/// Convert the user-chosen pattern array into a string like "0,0-0,1-1,1-2,2"
 fn pattern_to_string(pattern: &[(usize, usize)]) -> String {
     pattern
         .iter()
@@ -1030,9 +1162,7 @@ fn encrypt_with_derived_key(
     rng.fill_bytes(&mut nonce_arr);
 
     let nonce = Nonce::from_slice(&nonce_arr);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| e.to_string())?;
+    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())?;
 
     let mut kb = key_bytes;
     kb.zeroize();
@@ -1050,9 +1180,7 @@ fn decrypt_with_derived_key(
     let cipher = Aes256Gcm::new(cipher_key);
 
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| e.to_string())?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
 
     let mut kb = key_bytes;
     kb.zeroize();
@@ -1073,9 +1201,7 @@ fn encrypt_vault_data(
     rng.fill_bytes(&mut nonce_arr);
 
     let nonce = Nonce::from_slice(&nonce_arr);
-    let ciphertext = cipher
-        .encrypt(nonce, json.as_slice())
-        .map_err(|e| e.to_string())?;
+    let ciphertext = cipher.encrypt(nonce, json.as_slice()).map_err(|e| e.to_string())?;
 
     Ok((nonce_arr.to_vec(), ciphertext))
 }
@@ -1088,9 +1214,7 @@ fn decrypt_vault_data(
     let cipher = Aes256Gcm::new(cipher_key);
 
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| e.to_string())?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
 
     let vault: Vec<VaultEntry> = serde_json::from_slice(&plaintext)?;
     Ok(vault)
