@@ -8,6 +8,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use directories::ProjectDirs;
 use eframe::{egui, App, Frame, NativeOptions};
 use eframe::CreationContext;
 use egui::{Color32, RichText};
@@ -96,8 +97,8 @@ struct QuickPassApp {
     use_lowercase: bool,
     use_uppercase: bool,
     use_digits: bool,
-    // Removed old `use_symbols` bool
-    symbol_toggles: Vec<SymbolToggle>, // user picks exactly which symbols
+    // Instead of a single bool, we use a list of toggles
+    symbol_toggles: Vec<SymbolToggle>,
 
     generated_password: String,
 
@@ -194,8 +195,22 @@ impl Default for QuickPassApp {
     }
 }
 
+/// Cross-platform location for "encrypted_vault.json"
 fn vault_file_path() -> PathBuf {
-    PathBuf::from("encrypted_vault.json")
+    // This identifies your app across OSes:
+    //   On macOS: ~/Library/Application Support/QuickPass
+    //   On Windows: C:\Users\<User>\AppData\Roaming\KANFER\QuickPass
+    //   On Linux: ~/.local/share/quickpass
+    if let Some(proj_dirs) = ProjectDirs::from("com", "KANFER", "QuickPass") {
+        let data_dir = proj_dirs.data_dir();
+        // Ensure the directory exists
+        let _ = fs::create_dir_all(data_dir);
+        data_dir.join("encrypted_vault.json")
+    } else {
+        // Fallback if we can't get a project dir
+        // Just store in current dir (not recommended)
+        PathBuf::from("encrypted_vault.json")
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -209,7 +224,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Egui app
+// eframe App Implementation
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -379,11 +394,10 @@ impl QuickPassApp {
         ui.checkbox(&mut self.use_uppercase, "Uppercase (A-Z)");
         ui.checkbox(&mut self.use_digits,   "Digits (0-9)");
 
-        // Instead of a single `use_symbols` bool, we show a grid of symbol toggles
+        // Symbol toggles
         ui.separator();
         ui.label("Select which symbols to include:");
         let original_spacing = ui.spacing().clone();
-        // For a cleaner symbol layout, let's do a grid:
         egui::Grid::new("symbol_grid").num_columns(8).show(ui, |ui| {
             for (i, st) in self.symbol_toggles.iter_mut().enumerate() {
                 ui.checkbox(&mut st.enabled, format!("{}", st.sym));
@@ -394,7 +408,7 @@ impl QuickPassApp {
         });
         *ui.spacing_mut() = original_spacing;
 
-        // Generate
+        // Generate button
         if ui.button("Generate Password").clicked() {
             let user_symbols = self.collect_enabled_symbols();
             self.generated_password = generate_password(
@@ -405,6 +419,7 @@ impl QuickPassApp {
                 &user_symbols
             );
         }
+
         ui.separator();
         ui.label("Generated Password:");
         ui.monospace(&self.generated_password);
@@ -448,7 +463,7 @@ impl QuickPassApp {
         }
     }
 
-    /// Gathers all user-enabled symbols into a Vec<char>.
+    /// Collect user-enabled symbols into a Vec<char>.
     fn collect_enabled_symbols(&self) -> Vec<char> {
         self.symbol_toggles
             .iter()
@@ -504,20 +519,16 @@ impl QuickPassApp {
             self.new_pattern_unlocked = true;
         }
 
-        // Remove spacing so in-between squares can't be clicked
         let original_spacing = ui.spacing().clone();
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
 
-        // 6×6 grid
         for row in 0..6 {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.new_pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
-
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.new_pattern_attempt.push((row, col));
                     }
@@ -544,7 +555,7 @@ impl QuickPassApp {
                     Err(e) => eprintln!("Change pattern error: {e}"),
                 }
             } else {
-                eprintln!("No vault key in memory, can't change pattern!");
+                eprintln!("No vault_key in memory, can't change pattern!");
             }
             self.show_change_pattern = false;
         }
@@ -599,7 +610,6 @@ impl QuickPassApp {
             self.first_run_pattern_unlocked = true;
         }
 
-        // remove spacing
         let original_spacing = ui.spacing().clone();
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
@@ -609,9 +619,7 @@ impl QuickPassApp {
                 for col in 0..6 {
                     let clicked = self.first_run_pattern.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
-
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
-
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.first_run_pattern.push((row, col));
                     }
@@ -619,7 +627,6 @@ impl QuickPassApp {
             });
         }
 
-        // restore spacing
         *ui.spacing_mut() = original_spacing;
     }
 
@@ -790,7 +797,6 @@ fn update_master_password_with_key(
     vault: &[VaultEntry],
     pattern_hash: Option<&str>,
 ) -> Result<String, Box<dyn StdError>> {
-    // Argon2-hash the new password
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_hash = argon2
@@ -826,7 +832,6 @@ fn update_pattern_with_key(
     vault_key: &[u8],
     vault: &[VaultEntry],
 ) -> Result<String, Box<dyn StdError>> {
-    // Hash the new pattern
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_ph = argon2
@@ -855,7 +860,7 @@ fn update_pattern_with_key(
     Ok(new_ph)
 }
 
-// --- Pattern strings ---
+// Pattern strings
 fn hash_pattern(pattern: &[(usize, usize)]) -> String {
     pattern_to_string(pattern)
 }
@@ -868,7 +873,7 @@ fn pattern_to_string(pattern: &[(usize, usize)]) -> String {
         .join("-")
 }
 
-// --- Key Derivation, Encryption, Decryption ---
+// Key Derivation, Encryption, Decryption
 fn derive_key_from_input(input: &[u8]) -> [u8; 32] {
     let argon2 = Argon2::default();
     let mut salt_buf = [0u8; 16];
