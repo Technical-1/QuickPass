@@ -19,6 +19,7 @@ use std::error::Error as StdError;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::PathBuf;
+use std::process;
 use std::sync::OnceLock;
 
 use rand::RngCore;
@@ -44,7 +45,7 @@ struct VaultEntry {
     password: String,
 }
 
-/// The on-disk format now includes two encryptions of the same `vault_key`:
+/// The on-disk format includes two encryptions of the same `vault_key`:
 #[derive(Serialize, Deserialize)]
 struct EncryptedVaultFile {
     // Argon2-Hashed credentials
@@ -95,17 +96,24 @@ struct QuickPassApp {
     new_website: String,
     new_username: String,
 
+    // Changing master password
     show_change_pw: bool,
     new_master_pw: String,
 
+    // Changing pattern
     show_change_pattern: bool,
     new_pattern_attempt: Vec<(usize, usize)>,
     new_pattern_unlocked: bool,
 
-    // first-run UI
+    // First-run UI
     first_run_password: String,
     first_run_pattern: Vec<(usize, usize)>,
     first_run_pattern_unlocked: bool,
+
+    // track failed login attempts
+    failed_attempts: u32,
+    // UI error message to show after failures
+    login_error_msg: String,
 }
 
 impl Default for QuickPassApp {
@@ -115,9 +123,7 @@ impl Default for QuickPassApp {
             vault: Vec::new(),
             file_exists: vault_file_path().exists(),
 
-            // We hold the vault_key if logged in
             current_vault_key: None,
-
             master_password_input: String::new(),
             pattern_attempt: Vec::new(),
             is_pattern_unlock: false,
@@ -145,6 +151,10 @@ impl Default for QuickPassApp {
             first_run_password: String::new(),
             first_run_pattern: Vec::new(),
             first_run_pattern_unlocked: false,
+
+            // NEW
+            failed_attempts: 0,
+            login_error_msg: String::new(),
         }
     }
 }
@@ -167,6 +177,11 @@ fn main() -> eframe::Result<()> {
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Display any login error message
+            if !self.login_error_msg.is_empty() {
+                ui.colored_label(Color32::RED, &self.login_error_msg);
+            }
+
             if !self.file_exists && !self.is_logged_in {
                 self.show_first_run_ui(ui);
             } else if !self.is_logged_in {
@@ -209,9 +224,9 @@ impl QuickPassApp {
         ui.separator();
         if ui.button("Create Vault").clicked() {
             if self.first_run_password.is_empty() {
-                eprintln!("Please type a master password!");
+                self.login_error_msg = "Please type a master password!".into();
             } else if !self.first_run_pattern_unlocked {
-                eprintln!("Please create a pattern (4+ clicks)!");
+                self.login_error_msg = "Please create a pattern (4+ clicks)!".into();
             } else {
                 let pattern_hash = hash_pattern(&self.first_run_pattern);
                 match create_new_vault_file(&self.first_run_password, &pattern_hash) {
@@ -222,8 +237,9 @@ impl QuickPassApp {
                         self.file_exists = true;
                         self.is_logged_in = true;
                         self.master_password_input = self.first_run_password.clone();
+                        self.login_error_msg.clear();
 
-                        // We now need to load the vault_key so we can do changes later
+                        // Load vault key
                         if let Ok((_, _, vault_key)) = load_vault_key_only(
                             &self.first_run_password, 
                             Some(pattern_hash.as_bytes())
@@ -232,7 +248,7 @@ impl QuickPassApp {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed first-run vault: {e}");
+                        self.login_error_msg = format!("Failed first-run vault: {e}");
                     }
                 }
             }
@@ -247,7 +263,7 @@ impl QuickPassApp {
         if ui.button("Login").clicked() {
             let pass = self.master_password_input.clone();
 
-            // FIX: we do load_vault_key_only(...) -> load_vault_data(...) -> THEN store the key
+            // Attempt text password login
             match load_vault_key_only(&pass, None) {
                 Ok((mh, ph, key)) => {
                     // Decrypt the vault data first:
@@ -258,16 +274,16 @@ impl QuickPassApp {
                             self.pattern_hash = ph;
                             self.vault = vault;
                             self.is_logged_in = true;
+                            self.login_error_msg.clear();
+                            self.failed_attempts = 0;
                         }
                         Err(e) => {
-                            eprintln!("Login error (decrypt vault): {e}");
-                            self.master_password_input.clear();
+                            self.handle_login_failure(format!("Login error (decrypt vault): {e}"));
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Login error: {e}");
-                    self.master_password_input.clear();
+                    self.handle_login_failure(format!("Login error: {e}"));
                 }
             }
         }
@@ -279,9 +295,8 @@ impl QuickPassApp {
         if self.is_pattern_unlock {
             ui.colored_label(Color32::GREEN, "Pattern unlocked!");
             if ui.button("Enter with Pattern").clicked() {
+                // Attempt pattern login
                 let pattern_str = pattern_to_string(&self.pattern_attempt);
-
-                // FIX: load_vault_key_only -> load_vault_data -> THEN store key
                 match load_vault_key_only("", Some(pattern_str.as_bytes())) {
                     Ok((mh, ph, key)) => {
                         match load_vault_data(&key) {
@@ -291,16 +306,18 @@ impl QuickPassApp {
                                 self.pattern_hash = ph;
                                 self.vault = vault;
                                 self.is_logged_in = true;
+                                self.login_error_msg.clear();
+                                self.failed_attempts = 0;
                             }
                             Err(e) => {
-                                eprintln!("Pattern login error (decrypt vault): {e}");
+                                self.handle_login_failure(format!("Pattern login error (decrypt vault): {e}"));
                                 self.pattern_attempt.clear();
                                 self.is_pattern_unlock = false;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Pattern login error: {e}");
+                        self.handle_login_failure(format!("Pattern login error: {e}"));
                         self.pattern_attempt.clear();
                         self.is_pattern_unlock = false;
                     }
@@ -542,6 +559,23 @@ impl QuickPassApp {
                     }
                 }
             });
+        }
+    }
+
+    // handle login failures
+    fn handle_login_failure(&mut self, err_msg: String) {
+        self.failed_attempts += 1;
+        let attempts_left = 3 - self.failed_attempts;
+        if self.failed_attempts >= 3 {
+            // Delete vault + exit
+            if vault_file_path().exists() {
+                let _ = fs::remove_file(vault_file_path());
+            }
+            // Show final error then exit
+            eprintln!("Too many failed attempts! Vault deleted, exiting...");
+            process::exit(1);
+        } else {
+            self.login_error_msg = format!("{err_msg} - Wrong credentials! You have {attempts_left} attempt(s) left before vault deletion.");
         }
     }
 }
