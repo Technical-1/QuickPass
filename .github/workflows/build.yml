@@ -1,61 +1,85 @@
-name: Build QuickPass Binaries
+name: Build and Sign macOS Binary
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Or trigger on tags, etc.
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ macos-latest, windows-latest, ubuntu-latest ]
+  build-and-sign-macos:
+    name: Build & Sign (macOS)
+    runs-on: macos-latest
 
     steps:
+      # 1) Checkout source
       - name: Check out code
         uses: actions/checkout@v3
 
+      # 2) Install Rust
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
 
-      - name: Build (release)
+      # 3) Build in release mode
+      - name: Cargo build
         run: cargo build --release
 
-      # -----------------------------
-      # Windows
-      # -----------------------------
-      - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: QuickPass-Windows
-          path: target/release/QuickPass.exe
-          # Overwrite if an artifact with the same name exists (optional)
-          overwrite: true
+      # 4) Import Developer ID Certificate from p12 stored in GitHub Secrets
+      - name: Install Code Signing Certificate
+        run: |
+          # Convert base64-encoded p12 back to binary:
+          echo "$APPLE_CERT" | base64 --decode > signing.p12
 
-      # -----------------------------
-      # macOS
-      # -----------------------------
-      - name: Upload artifact (macOS)
-        if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: QuickPass-macOS
-          path: target/release/QuickPass
-          overwrite: true
+          # Create a temporary keychain:
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
 
-      # -----------------------------
-      # Linux
-      # -----------------------------
-      - name: Upload artifact (Linux)
-        if: matrix.os == 'ubuntu-latest'
+          # Import the p12
+          security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
+
+          # Ensure codesign can access the key without prompting
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_CERT }}
+          APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
+
+      # 5) Code Sign your Rust binary
+      - name: Code Sign
+        run: |
+          codesign --deep --force --options runtime \
+            --sign "Developer ID Application: Your Name (TEAMID)" \
+            target/release/QuickPass
+        # REPLACE "Your Name (TEAMID)" exactly with your certificate name from Keychain Access
+
+      # 6) (Optional) Notarize + staple
+      - name: Notarize
+        if: env.APPLE_APP_SPECIFIC_PASSWORD
+        run: |
+          # Zip the signed binary
+          cd target/release
+          zip QuickPass.zip QuickPass
+
+          # Submit to Apple Notary
+          xcrun notarytool submit QuickPass.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+          # Staple the ticket
+          xcrun stapler staple QuickPass
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+      # 7) Upload artifact
+      - name: Upload signed artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QuickPass-Linux
+          name: QuickPass-signed
           path: target/release/QuickPass
-          overwrite: true
