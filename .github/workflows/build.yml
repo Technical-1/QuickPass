@@ -57,7 +57,7 @@ jobs:
       # 6) Code sign only the .app
       - name: Code Sign .app
         run: |
-          codesign --deep --force --options runtime \
+          codesign --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
 
