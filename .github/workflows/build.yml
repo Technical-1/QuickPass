@@ -74,7 +74,7 @@ jobs:
             -ov
 
       # 8) Notarize the .dmg (capture text with tee), parse ID + status
-            - name: Notarize .dmg
+      - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
           cd target/release
