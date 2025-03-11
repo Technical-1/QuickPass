@@ -47,12 +47,12 @@ jobs:
       # 5) Create a minimal Info.plist & build .app structure
       - name: Create .app bundle
         run: |
-          mkdir -p QuickPass.app/Contents/MacOS
-          # 1) Copy compiled CLI into .app
-          cp target/release/QuickPass QuickPass.app/Contents/MacOS/
+    mkdir -p QuickPass.app/Contents/MacOS
+    # Copy compiled CLI into .app
+    cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # 2) Create minimal Info.plist
-          cat <<EOF > QuickPass.app/Contents/Info.plist
+    # Create minimal Info.plist via a here-doc
+    cat <<EOF > QuickPass.app/Contents/Info.plist
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,6 +69,7 @@ jobs:
 </dict>
 </plist>
 EOF
+
 
       # 6) Code sign the .app
       - name: Code Sign .app
