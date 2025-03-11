@@ -1,32 +1,70 @@
-name: "Build Rust CLI -> .app -> .dmg -> Notarize"
+name: "QuickPass Build & Release"
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  
 
 jobs:
-  build-macos-dmg:
-    name: "Build, .app, Notarize macOS"
-    runs-on: macos-latest
+  # ------------------------------------------------
+  # (1) Build Windows & Linux
+  # ------------------------------------------------
+  build-windows-linux:
+    name: "Build (Windows & Linux)"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
 
     steps:
-      # 1) Check out code
       - name: Check out code
         uses: actions/checkout@v3
 
-      # 2) Install Rust
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
 
-      # 3) Build CLI in release mode
+      - name: Cargo build (release)
+        run: cargo build --release
+
+      # Upload artifact for Windows
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickPass-Windows
+          path: target/release/QuickPass.exe
+          overwrite: true
+
+      # Upload artifact for Linux
+      - name: Upload artifact (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickPass-Linux
+          path: target/release/QuickPass
+          overwrite: true
+
+  # ------------------------------------------------
+  # (2) Build & Notarize macOS .dmg
+  # ------------------------------------------------
+  build-macos-dmg:
+    name: "Build, .app, Notarize macOS"
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
       - name: Cargo build
         run: cargo build --release
 
-      # 4) Import Developer ID certificate + AppleWWDRCAG3 intermediate
       - name: Install Code Signing Certificate
         run: |
           echo "$APPLE_CERT" | base64 --decode > signing.p12
@@ -38,57 +76,45 @@ jobs:
           curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
           security import AppleWWDRCAG3.cer -k build.keychain
 
-          # Now import your Developer ID .p12
           security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
-
           security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
         env:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Create .app folder and copy Info.plist from the repo
       - name: Create .app bundle
         run: |
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          # Copy the Info.plist from your repo
           cp .github/workflows/Info.plist QuickPass.app/Contents/Info.plist
 
-          # Create the Resources folder and copy icon.icns
           mkdir -p QuickPass.app/Contents/Resources
           cp .github/workflows/icon.icns QuickPass.app/Contents/Resources/icon.icns
 
-      # 6) Code sign .app (no --deep)
       - name: Code Sign .app
         run: |
           codesign --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
 
-      # 7) Debug-check the signed .app
       - name: Debug Signed .app
         run: |
-          echo "=== codesign -dv --verbose=4 ==="
           codesign -dv --verbose=4 QuickPass.app
-          echo "=== spctl -a -vvv QuickPass.app ==="
           spctl -a -vvv QuickPass.app || true
 
-      # 8) Make .dmg using HFS+ (skip code signing the .dmg)
       - name: Create .dmg
         run: |
           mv QuickPass.app target/release/
           cd target/release
           mkdir QuickPassDmgContent
           mv QuickPass.app QuickPassDmgContent/
-
           hdiutil create QuickPass.dmg \
             -volname "QuickPass" \
             -srcfolder "QuickPassDmgContent" \
             -fs HFS+ \
             -ov
 
-      # 9) Notarize the .dmg, capturing logs
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
@@ -128,10 +154,70 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
 
-      # 10) Upload final .dmg
       - name: Upload notarized .dmg
         uses: actions/upload-artifact@v4
         with:
           name: QuickPass-macOS-dmg
           path: target/release/QuickPass.dmg
           overwrite: true
+
+  # ------------------------------------------------
+  # (3) Release Job
+  # ------------------------------------------------
+  release:
+    name: "Create GitHub Release"
+    runs-on: ubuntu-latest
+    needs: [ build-windows-linux, build-macos-dmg ]
+
+    steps:
+      - name: Download Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: QuickPass-Windows
+          path: ./dist
+
+      - name: Download Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: QuickPass-Linux
+          path: ./dist
+
+      - name: Download macOS dmg
+        uses: actions/download-artifact@v4
+        with:
+          name: QuickPass-macOS-dmg
+          path: ./dist
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Windows
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/QuickPass.exe
+          asset_name: QuickPass-Windows.exe
+          asset_content_type: application/octet-stream
+
+      - name: Upload Linux
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/QuickPass
+          asset_name: QuickPass-Linux
+          asset_content_type: application/octet-stream
+
+      - name: Upload mac dmg
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/QuickPass.dmg
+          asset_name: QuickPass-macOS.dmg
+          asset_content_type: application/octet-stream
