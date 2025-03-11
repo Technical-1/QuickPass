@@ -87,7 +87,6 @@ jobs:
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --primary-bundle-id "com.KANFER.QuickPass" \
             --wait
 
           # After success, staple the .dmg
