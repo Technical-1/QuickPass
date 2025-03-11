@@ -1,17 +1,17 @@
-name: "Build Rust CLI, wrap in .dmg, Notarize"
+name: "Build Rust CLI -> .app -> .dmg -> Notarize"
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # Or if you want to auto-release on tags, add:
+  # Or if you want auto-release on tags, add:
   #   tags:
   #     - 'v*.*.*'
 
 jobs:
   build-macos-dmg:
-    name: "Build, Sign & Notarize macOS (.dmg)"
+    name: "Build, .app, Sign & Notarize macOS"
     runs-on: macos-latest
 
     steps:
@@ -29,7 +29,7 @@ jobs:
       - name: Cargo build
         run: cargo build --release
 
-      # 4) Import Developer ID Application certificate
+      # 4) Import Developer ID certificate (from secrets)
       - name: Install Code Signing Certificate
         run: |
           echo "$APPLE_CERT" | base64 --decode > signing.p12
@@ -44,35 +44,64 @@ jobs:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Codesign the CLI binary
-      - name: Code Sign CLI
+      # 5) Create a minimal Info.plist & build .app structure
+      - name: Create .app bundle
+        run: |
+          mkdir -p QuickPass.app/Contents/MacOS
+          # 1) Copy compiled CLI into .app
+          cp target/release/QuickPass QuickPass.app/Contents/MacOS/
+
+          # 2) Create minimal Info.plist
+          cat <<EOF > QuickPass.app/Contents/Info.plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.yourdomain.QuickPass</string>
+  <key>CFBundleName</key>
+  <string>QuickPass</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+</dict>
+</plist>
+EOF
+
+      # 6) Code sign the .app
+      - name: Code Sign .app
         run: |
           codesign --deep --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
-            target/release/QuickPass
+            QuickPass.app
 
-      # 6) Create a .dmg containing the signed CLI
+      # 7) Create a .dmg from the .app
       - name: Create .dmg
         run: |
+          # We'll place it in target/release to keep things organized
+          mv QuickPass.app target/release/
           cd target/release
 
-          # Create a folder to hold the CLI (optionally add a README)
+          # Create folder for dmg contents if you'd like a custom layout:
           mkdir QuickPassDmgContent
-          cp QuickPass QuickPassDmgContent/
+          mv QuickPass.app QuickPassDmgContent/
 
+          # Build the dmg
           hdiutil create QuickPass.dmg \
             -volname "QuickPass" \
             -srcfolder "QuickPassDmgContent" \
             -ov
 
-      # 7) Code sign the .dmg itself
+      # 8) Code sign the .dmg itself
       - name: Code Sign .dmg
         run: |
           codesign --force --options runtime --deep \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             target/release/QuickPass.dmg
 
-      # 8) Notarize the .dmg
+      # 9) Notarize the .dmg
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
@@ -83,14 +112,14 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --wait
 
-          # Staple the .dmg
+          # After success, staple
           xcrun stapler staple QuickPass.dmg
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
 
-      # 9) Upload final .dmg artifact
+      # 10) Upload final .dmg artifact
       - name: Upload notarized .dmg
         uses: actions/upload-artifact@v4
         with:
