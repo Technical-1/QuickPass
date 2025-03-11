@@ -51,9 +51,8 @@ jobs:
       - name: Code Sign
         run: |
           codesign --deep --force --options runtime \
-            --sign "Apple Development: Jacob Kanfer (9T6VK743AG)" \
+            --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             target/release/QuickPass
-        # REPLACE "Your Name (TEAMID)" exactly with your certificate name from Keychain Access
 
       # 6) (Optional) Notarize + staple
       - name: Notarize
