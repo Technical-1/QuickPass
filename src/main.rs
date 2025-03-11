@@ -36,6 +36,13 @@ fn global_salt() -> &'static SaltString {
     })
 }
 
+/// For letting the user pick exactly which symbols to include:
+#[derive(Clone)]
+struct SymbolToggle {
+    sym: char,
+    enabled: bool,
+}
+
 /// A small struct representing each vault entry
 #[derive(Clone, Serialize, Deserialize)]
 struct VaultEntry {
@@ -84,14 +91,17 @@ struct QuickPassApp {
     master_hash: Option<String>,
     pattern_hash: Option<String>,
 
-    // Password generation
+    // Password generation toggles
     length: usize,
     use_lowercase: bool,
     use_uppercase: bool,
     use_digits: bool,
-    use_symbols: bool,
+    // Removed old `use_symbols` bool
+    symbol_toggles: Vec<SymbolToggle>, // user picks exactly which symbols
+
     generated_password: String,
 
+    // Vault entry temp fields
     new_website: String,
     new_username: String,
 
@@ -133,7 +143,35 @@ impl Default for QuickPassApp {
             use_lowercase: true,
             use_uppercase: true,
             use_digits: true,
-            use_symbols: true,
+            // Pre-populate some common symbols:
+            symbol_toggles: vec![
+                SymbolToggle { sym: '!', enabled: true },
+                SymbolToggle { sym: '@', enabled: true },
+                SymbolToggle { sym: '#', enabled: true },
+                SymbolToggle { sym: '$', enabled: true },
+                SymbolToggle { sym: '%', enabled: true },
+                SymbolToggle { sym: '^', enabled: true },
+                SymbolToggle { sym: '&', enabled: true },
+                SymbolToggle { sym: '*', enabled: true },
+                SymbolToggle { sym: '(', enabled: true },
+                SymbolToggle { sym: ')', enabled: true },
+                SymbolToggle { sym: '-', enabled: true },
+                SymbolToggle { sym: '_', enabled: true },
+                SymbolToggle { sym: '=', enabled: true },
+                SymbolToggle { sym: '+', enabled: true },
+                SymbolToggle { sym: '[', enabled: true },
+                SymbolToggle { sym: ']', enabled: true },
+                SymbolToggle { sym: '{', enabled: true },
+                SymbolToggle { sym: '}', enabled: true },
+                SymbolToggle { sym: ':', enabled: true },
+                SymbolToggle { sym: ';', enabled: true },
+                SymbolToggle { sym: ',', enabled: true },
+                SymbolToggle { sym: '.', enabled: true },
+                SymbolToggle { sym: '<', enabled: true },
+                SymbolToggle { sym: '>', enabled: true },
+                SymbolToggle { sym: '?', enabled: true },
+                SymbolToggle { sym: '/', enabled: true },
+            ],
             generated_password: String::new(),
 
             new_website: String::new(),
@@ -171,6 +209,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Egui app
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -199,6 +238,7 @@ impl App for QuickPassApp {
 // UI Scenes
 // ----------------------------------
 impl QuickPassApp {
+    // --------------- FIRST RUN UI ---------------
     fn show_first_run_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("First time opened!").size(28.0).color(Color32::RED));
         ui.label("You must set BOTH a master password AND a pattern.");
@@ -208,8 +248,8 @@ impl QuickPassApp {
         ui.add(egui::TextEdit::singleline(&mut self.first_run_password).password(true));
 
         ui.separator();
-        ui.label("Create a Pattern (need at least 8 clicks on a 6×6 grid):");
-        self.show_pattern_lock_first_run(ui); // 6×6 grid
+        ui.label("Create a Pattern (6×6 grid, need >=8 clicks):");
+        self.show_pattern_lock_first_run(ui);
 
         if self.first_run_pattern_unlocked {
             ui.colored_label(Color32::GREEN, "Pattern set!");
@@ -251,6 +291,7 @@ impl QuickPassApp {
         }
     }
 
+    // --------------- LOGIN UI ---------------
     fn show_login_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Welcome Back to QuickPass").size(30.0).color(Color32::GRAY));
         ui.label("Enter your master password:");
@@ -325,25 +366,43 @@ impl QuickPassApp {
         }
     }
 
+    // --------------- MAIN UI ---------------
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("QuickPass - Vault").size(30.0).color(Color32::GRAY));
 
+        // Sliders/checkboxes for password generation
         ui.horizontal(|ui| {
             ui.label("Length:");
             ui.add(egui::Slider::new(&mut self.length, 1..=128).text("characters"));
         });
         ui.checkbox(&mut self.use_lowercase, "Lowercase (a-z)");
         ui.checkbox(&mut self.use_uppercase, "Uppercase (A-Z)");
-        ui.checkbox(&mut self.use_digits, "Digits (0-9)");
-        ui.checkbox(&mut self.use_symbols, "Symbols (!@#...)");
+        ui.checkbox(&mut self.use_digits,   "Digits (0-9)");
 
+        // Instead of a single `use_symbols` bool, we show a grid of symbol toggles
+        ui.separator();
+        ui.label("Select which symbols to include:");
+        let original_spacing = ui.spacing().clone();
+        // For a cleaner symbol layout, let's do a grid:
+        egui::Grid::new("symbol_grid").num_columns(8).show(ui, |ui| {
+            for (i, st) in self.symbol_toggles.iter_mut().enumerate() {
+                ui.checkbox(&mut st.enabled, format!("{}", st.sym));
+                if (i + 1) % 8 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+        *ui.spacing_mut() = original_spacing;
+
+        // Generate
         if ui.button("Generate Password").clicked() {
+            let user_symbols = self.collect_enabled_symbols();
             self.generated_password = generate_password(
                 self.length,
                 self.use_lowercase,
                 self.use_uppercase,
                 self.use_digits,
-                self.use_symbols,
+                &user_symbols
             );
         }
         ui.separator();
@@ -389,6 +448,16 @@ impl QuickPassApp {
         }
     }
 
+    /// Gathers all user-enabled symbols into a Vec<char>.
+    fn collect_enabled_symbols(&self) -> Vec<char> {
+        self.symbol_toggles
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.sym)
+            .collect()
+    }
+
+    // --------------- CHANGE MASTER PASSWORD UI ---------------
     fn show_change_password_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Change Master Password");
         ui.label("New Password:");
@@ -426,13 +495,18 @@ impl QuickPassApp {
         }
     }
 
+    // --------------- CHANGE PATTERN UI ---------------
     fn show_change_pattern_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Change Pattern (6×6 grid)");
-        ui.label("Create a new pattern (need at least 8 clicks).");
+        ui.label("Create a new pattern (need >=8 clicks).");
 
         if self.new_pattern_attempt.len() >= 8 {
             self.new_pattern_unlocked = true;
         }
+
+        // Remove spacing so in-between squares can't be clicked
+        let original_spacing = ui.spacing().clone();
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
         // 6×6 grid
         for row in 0..6 {
@@ -440,13 +514,16 @@ impl QuickPassApp {
                 for col in 0..6 {
                     let clicked = self.new_pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
+                    // fix button size so no space in between
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
-                    if ui.add(btn).clicked() {
+                    if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.new_pattern_attempt.push((row, col));
                     }
                 }
             });
         }
+
+        *ui.spacing_mut() = original_spacing;
 
         if self.new_pattern_unlocked {
             ui.colored_label(Color32::GREEN, "New pattern set!");
@@ -465,7 +542,7 @@ impl QuickPassApp {
                     Err(e) => eprintln!("Change pattern error: {e}"),
                 }
             } else {
-                eprintln!("No vault_key in memory, can't change pattern!");
+                eprintln!("No vault key in memory, can't change pattern!");
             }
             self.show_change_pattern = false;
         }
@@ -477,6 +554,7 @@ impl QuickPassApp {
         }
     }
 
+    // --------------- VAULT UI ---------------
     fn show_vault_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Vault Entries").size(20.0).color(Color32::DARK_GRAY));
 
@@ -513,49 +591,64 @@ impl QuickPassApp {
         }
     }
 
-    // 6×6 for first run, must have >=8 to unlock
+    // --------------- FIRST-RUN PATTERN (6×6) ---------------
     fn show_pattern_lock_first_run(&mut self, ui: &mut egui::Ui) {
         if self.first_run_pattern.len() >= 8 {
             self.first_run_pattern_unlocked = true;
         }
+
+        // remove spacing
+        let original_spacing = ui.spacing().clone();
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
         for row in 0..6 {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.first_run_pattern.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
-                    if ui.add(btn).clicked() {
+                    if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.first_run_pattern.push((row, col));
                     }
                 }
             });
         }
+
+        // restore spacing
+        *ui.spacing_mut() = original_spacing;
     }
 
-    // 6×6 for login, must have >=8 to unlock
+    // --------------- LOGIN PATTERN (6×6) ---------------
     fn show_pattern_lock_login(&mut self, ui: &mut egui::Ui) {
         if self.pattern_attempt.len() >= 8 {
             self.is_pattern_unlock = true;
         }
+
+        let original_spacing = ui.spacing().clone();
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
         for row in 0..6 {
             ui.horizontal(|ui| {
                 for col in 0..6 {
                     let clicked = self.pattern_attempt.contains(&(row, col));
                     let clr = if clicked { Color32::RED } else { Color32::DARK_BLUE };
                     let btn = egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
-                    if ui.add(btn).clicked() {
+                    if ui.add_sized((35.0, 35.0), btn).clicked() {
                         self.pattern_attempt.push((row, col));
                     }
                 }
             });
         }
+
+        *ui.spacing_mut() = original_spacing;
     }
 
-    // If user fails login, increment attempts or delete the vault if 3 fails
+    // --------------- FAILED ATTEMPTS ---------------
     fn handle_login_failure(&mut self, err_msg: String) {
         self.failed_attempts += 1;
         let attempts_left = 3 - self.failed_attempts;
         if self.failed_attempts >= 3 {
+            // Delete vault + exit
             if vault_file_path().exists() {
                 let _ = fs::remove_file(vault_file_path());
             }
@@ -635,7 +728,7 @@ fn load_vault_key_only(
         let nonce_pt = file.nonce_pt.as_ref().ok_or("No nonce_pt!")?;
 
         let vault_key = decrypt_with_derived_key(enc_key_pt, nonce_pt, patt_bytes)?;
-        Ok((file.master_hash, file.pattern_hash, vault_key))
+        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
     } else {
         // text-based
         if !master_password.is_empty() {
@@ -649,7 +742,7 @@ fn load_vault_key_only(
             &file.nonce_pw,
             master_password.as_bytes(),
         )?;
-        Ok((file.master_hash, file.pattern_hash, vault_key))
+        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
     }
 }
 
@@ -678,7 +771,7 @@ fn save_vault_file(
     file.vault_ciphertext = vault_ciphertext;
 
     file.master_hash = master_hash.to_string();
-    file.pattern_hash = pattern_hash.map(|s| s.to_string());
+    file.pattern_hash = pattern_hash.map(str::to_string);
 
     let serialized = serde_json::to_string_pretty(&file)?;
     fs::write(vault_file_path(), serialized)?;
@@ -692,7 +785,7 @@ fn update_master_password_with_key(
     vault: &[VaultEntry],
     pattern_hash: Option<&str>,
 ) -> Result<String, Box<dyn StdError>> {
-    // 1) Argon2-hash the new password
+    // Argon2-hash the new password
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_hash = argon2
@@ -700,13 +793,13 @@ fn update_master_password_with_key(
         .map_err(|e| e.to_string())?
         .to_string();
 
-    // 2) Re-encrypt the vault_key with new password
+    // Re-encrypt the vault_key with new password
     let (encrypted_key_pw, nonce_pw) = encrypt_with_derived_key(vault_key, new_password.as_bytes())?;
 
-    // 3) Re-encrypt the vault data
+    // Re-encrypt the vault data
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
 
-    // 4) Update the file
+    // Update the file
     let data = fs::read_to_string(vault_file_path())?;
     let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
     file.master_hash = new_hash.clone();
@@ -728,7 +821,7 @@ fn update_pattern_with_key(
     vault_key: &[u8],
     vault: &[VaultEntry],
 ) -> Result<String, Box<dyn StdError>> {
-    // 1) Hash the new pattern
+    // Hash the new pattern
     let argon2 = Argon2::default();
     let salt_str = global_salt();
     let new_ph = argon2
@@ -736,13 +829,13 @@ fn update_pattern_with_key(
         .map_err(|e| e.to_string())?
         .to_string();
 
-    // 2) Re-encrypt vault_key with new pattern
+    // Re-encrypt vault_key with new pattern
     let (encrypted_key_pt, nonce_pt) = encrypt_with_derived_key(vault_key, new_pattern_str.as_bytes())?;
 
-    // 3) Re-encrypt vault data
+    // Re-encrypt vault data
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
 
-    // 4) Update file
+    // Update file
     let data = fs::read_to_string(vault_file_path())?;
     let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
@@ -757,7 +850,7 @@ fn update_pattern_with_key(
     Ok(new_ph)
 }
 
-// Pattern strings
+// --- Pattern strings ---
 fn hash_pattern(pattern: &[(usize, usize)]) -> String {
     pattern_to_string(pattern)
 }
@@ -770,7 +863,7 @@ fn pattern_to_string(pattern: &[(usize, usize)]) -> String {
         .join("-")
 }
 
-// Derive key from user input
+// --- Key Derivation, Encryption, Decryption ---
 fn derive_key_from_input(input: &[u8]) -> [u8; 32] {
     let argon2 = Argon2::default();
     let mut salt_buf = [0u8; 16];
@@ -781,7 +874,6 @@ fn derive_key_from_input(input: &[u8]) -> [u8; 32] {
     key
 }
 
-/// AES-GCM encrypt `plaintext` using a key derived from `input`
 fn encrypt_with_derived_key(
     plaintext: &[u8],
     input: &[u8],
@@ -805,7 +897,6 @@ fn encrypt_with_derived_key(
     Ok((ciphertext, nonce_arr.to_vec()))
 }
 
-/// AES-GCM decrypt `ciphertext` using a key derived from `input`
 fn decrypt_with_derived_key(
     ciphertext: &[u8],
     nonce_bytes: &[u8],
@@ -816,9 +907,7 @@ fn decrypt_with_derived_key(
     let cipher = Aes256Gcm::new(cipher_key);
 
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| e.to_string())?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
 
     let mut kb = key_bytes;
     kb.zeroize();
@@ -826,7 +915,6 @@ fn decrypt_with_derived_key(
     Ok(plaintext)
 }
 
-// Vault encryption
 fn encrypt_vault_data(
     vault: &[VaultEntry],
     vault_key: &[u8]
