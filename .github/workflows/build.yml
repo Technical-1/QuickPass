@@ -5,17 +5,17 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # Or if you want auto-release on tags, add:
+  # If you want to auto-release on tags, also add:
   #   tags:
   #     - 'v*.*.*'
 
 jobs:
   build-macos-dmg:
-    name: "Build, .app, Sign & Notarize macOS"
+    name: "Build, .app, Notarize macOS"
     runs-on: macos-latest
 
     steps:
-      # 1) Check out code
+      # 1) Check out
       - name: Check out code
         uses: actions/checkout@v3
 
@@ -25,11 +25,11 @@ jobs:
         with:
           toolchain: stable
 
-      # 3) Build CLI in release mode
+      # 3) Build CLI
       - name: Cargo build
         run: cargo build --release
 
-      # 4) Import Developer ID certificate (from secrets)
+      # 4) Import Developer ID certificate
       - name: Install Code Signing Certificate
         run: |
           echo "$APPLE_CERT" | base64 --decode > signing.p12
@@ -44,46 +44,41 @@ jobs:
           APPLE_CERT: ${{ secrets.APPLE_CERT }}
           APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
 
-      # 5) Create a minimal Info.plist & build .app structure
+      # 5) Create .app folder + Info.plist
       - name: Create .app bundle
         run: |
           mkdir -p QuickPass.app/Contents/MacOS
           cp target/release/QuickPass QuickPass.app/Contents/MacOS/
 
-          echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\<plist version=\"1.0\">\n\<dict>\n\  <key>CFBundleIdentifier</key>\n\  <string>com.yourdomain.QuickPass</string>\n\  <key>CFBundleName</key>\n\  <string>QuickPass</string>\n\  <key>CFBundleShortVersionString</key>\n\  <string>1.0</string>\n\  <key>CFBundleVersion</key>\n\  <string>1</string>\n\</dict>\n\</plist>\n" > QuickPass.app/Contents/Info.plist
+          # Minimal Info.plist with CFBundleIdentifier
+          echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\<plist version=\"1.0\">\n\<dict>\n\  <key>CFBundleIdentifier</key>\n\  <string>com.KANFER.QuickPass</string>\n\  <key>CFBundleName</key>\n\  <string>QuickPass</string>\n\  <key>CFBundleShortVersionString</key>\n\  <string>1.0</string>\n\  <key>CFBundleVersion</key>\n\  <string>1</string>\n\</dict>\n\</plist>\n" > QuickPass.app/Contents/Info.plist
 
-      # 6) Code sign the .app
+
+      # 6) Code sign only the .app
       - name: Code Sign .app
         run: |
           codesign --deep --force --options runtime \
             --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
             QuickPass.app
 
-      # 7) Create a .dmg from the .app
+      # 7) Make .dmg with HFS+ (skip code signing the .dmg)
       - name: Create .dmg
         run: |
-          # We'll place it in target/release to keep things organized
+          # Move .app into target/release
           mv QuickPass.app target/release/
           cd target/release
 
-          # Create folder for dmg contents if you'd like a custom layout:
           mkdir QuickPassDmgContent
           mv QuickPass.app QuickPassDmgContent/
 
-          # Build the dmg
+          # Create .dmg using HFS+ filesystem
           hdiutil create QuickPass.dmg \
             -volname "QuickPass" \
             -srcfolder "QuickPassDmgContent" \
+            -fs HFS+ \
             -ov
 
-      # 8) Code sign the .dmg itself
-      - name: Code Sign .dmg
-        run: |
-          codesign --force --options runtime --deep \
-            --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
-            target/release/QuickPass.dmg
-
-      # 9) Notarize the .dmg
+      # 8) Notarize the .dmg with primary-bundle-id
       - name: Notarize .dmg
         if: env.APPLE_APP_SPECIFIC_PASSWORD
         run: |
@@ -92,16 +87,17 @@ jobs:
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --primary-bundle-id "com.KANFER.QuickPass" \
             --wait
 
-          # After success, staple
+          # After success, staple the .dmg
           xcrun stapler staple QuickPass.dmg
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
 
-      # 10) Upload final .dmg artifact
+      # 9) Upload final .dmg
       - name: Upload notarized .dmg
         uses: actions/upload-artifact@v4
         with:
