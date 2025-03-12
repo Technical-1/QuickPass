@@ -3,7 +3,7 @@ use egui::{Color32, RichText};
 use zeroize::Zeroize;
 
 use crate::manager::{scan_vaults_in_dir, vault_file_path};
-use crate::password::generate_password;
+use crate::password::{estimate_entropy, generate_password};
 use crate::security::SecurityLevel;
 use crate::vault::{
     VaultEntry, create_new_vault_file, load_vault_data_decrypted, load_vault_key_only,
@@ -53,6 +53,8 @@ pub struct QuickPassApp {
     // For adding new vault entries
     pub new_website: String,
     pub new_username: String,
+    pub new_tags_str: String, // typed tags for new entry
+    pub tag_filter: String,   // filter string
 
     // Changing master password
     pub show_change_pw: bool,
@@ -118,6 +120,8 @@ impl Default for QuickPassApp {
 
             new_website: String::new(),
             new_username: String::new(),
+            new_tags_str: String::new(),
+            tag_filter: String::new(),
 
             show_change_pw: false,
             new_master_pw_old_input: String::new(),
@@ -215,7 +219,7 @@ impl QuickPassApp {
         ui.heading(
             RichText::new("Vault Manager")
                 .size(28.0)
-                .color(Color32::YELLOW),
+                .color(Color32::WHITE),
         );
         ui.label("Manage multiple vaults below.");
 
@@ -226,7 +230,6 @@ impl QuickPassApp {
             let vault_list = self.manager_vaults.clone();
             for vault_name in vault_list {
                 ui.horizontal(|ui| {
-                    // Load the EncryptedVaultFile top-level, read its unencrypted last_accessed_plaintext
                     use crate::vault::read_encrypted_vault_file;
                     let maybe_timestamp =
                         if let Ok(ef) = read_encrypted_vault_file(vault_file_path(&vault_name)) {
@@ -527,138 +530,528 @@ impl QuickPassApp {
 
     // (D) Main Vault UI
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
-        let vault_name = self.active_vault_name.clone().unwrap_or_default();
-        ui.heading(
-            RichText::new(format!("QuickPass - Vault: {}", vault_name))
-                .size(30.0)
-                .color(Color32::GRAY),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Length:");
-            ui.add(egui::Slider::new(&mut self.length, 1..=128).text("characters"));
-        });
-        ui.checkbox(&mut self.use_lowercase, "Lowercase (a-z)");
-        ui.checkbox(&mut self.use_uppercase, "Uppercase (A-Z)");
-        ui.checkbox(&mut self.use_digits, "Digits (0-9)");
-
-        ui.separator();
-        ui.label("Select which symbols to include:");
-        let original_spacing = ui.spacing().clone();
-        egui::Grid::new("symbol_grid")
-            .num_columns(8)
+        // We'll wrap the entire page in a vertical scroll so if things are cut off,
+        // the user can scroll down.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .max_width(750.0)
             .show(ui, |ui| {
-                for (i, st) in self.symbol_toggles.iter_mut().enumerate() {
-                    ui.checkbox(&mut st.enabled, format!("{}", st.sym));
-                    if (i + 1) % 8 == 0 {
-                        ui.end_row();
+                // (1) Center the vault name, smaller text:
+                ui.vertical_centered(|ui| {
+                    ui.heading(
+                        RichText::new("Password Options:")
+                            .size(22.0)
+                            .color(Color32::WHITE),
+                    );
+                });
+
+                ui.separator();
+                // (2) Two columns for password generation toggles:
+                ui.columns(2, |cols| {
+                    // Left column for checkboxes
+                    cols[0].with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.checkbox(&mut self.use_lowercase, "Lowercase (a-z)");
+                        ui.checkbox(&mut self.use_uppercase, "Uppercase (A-Z)");
+                        ui.checkbox(&mut self.use_digits, "Digits (0-9)");
+                        ui.horizontal(|ui| {
+                            ui.label("Length:");
+                            ui.add(egui::Slider::new(&mut self.length, 1..=128).text("chars"));
+                        });
+                    });
+
+                    // Right column for symbol selection
+                    cols[1].with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        ui.label("Symbols to include:");
+                        let original_spacing = ui.spacing().clone();
+                        egui::Grid::new("symbol_grid")
+                            .num_columns(8)
+                            .show(ui, |ui| {
+                                for (i, st) in self.symbol_toggles.iter_mut().enumerate() {
+                                    ui.checkbox(&mut st.enabled, format!("{}", st.sym));
+                                    if (i + 1) % 8 == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        ui.spacing_mut().clone_from(&original_spacing);
+                    });
+                });
+
+                ui.separator();
+
+                ui.vertical_centered(|ui| {
+                    ui.heading(
+                        RichText::new("Store/Generate Logins")
+                            .size(22.0)
+                            .color(Color32::WHITE),
+                    );
+                });
+                ui.separator();
+
+                // Website + Username in one line:
+                ui.horizontal(|ui| {
+                    ui.label("Website:");
+                    ui.text_edit_singleline(&mut self.new_website);
+                    ui.label("Tag:");
+                    egui::ComboBox::from_label("")
+                        .selected_text(&self.new_tags_str)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.new_tags_str,
+                                "Social".to_string(),
+                                "Social",
+                            );
+                            ui.selectable_value(&mut self.new_tags_str, "Work".to_string(), "Work");
+                            ui.selectable_value(
+                                &mut self.new_tags_str,
+                                "School".to_string(),
+                                "School",
+                            );
+                            ui.selectable_value(
+                                &mut self.new_tags_str,
+                                "Personal".to_string(),
+                                "Personal",
+                            );
+                            ui.selectable_value(
+                                &mut self.new_tags_str,
+                                "Extra".to_string(),
+                                "Extra",
+                            );
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Username:");
+                    ui.text_edit_singleline(&mut self.new_username);
+                });
+
+                // Next line: password + generate button + tag
+                ui.horizontal(|ui| {
+                    ui.label("Password:");
+                    // Visible text field so the user can see the password
+                    ui.text_edit_singleline(&mut self.generated_password);
+
+                    if ui.button("↻ Generate").clicked() {
+                        let user_symbols = self.collect_enabled_symbols();
+                        self.generated_password = generate_password(
+                            self.length,
+                            self.use_lowercase,
+                            self.use_uppercase,
+                            self.use_digits,
+                            &user_symbols,
+                        );
+                    }
+                    // Show the entropy rating below the password text field, if not empty
+                    if !self.generated_password.is_empty() {
+                        let bits = estimate_entropy(&self.generated_password);
+                        let strength_label = if bits < 60.0 {
+                            ("Weak", Color32::RED)
+                        } else if bits <= 100.0 {
+                            ("Okay", Color32::YELLOW)
+                        } else {
+                            ("Strong", Color32::GREEN)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                strength_label.1,
+                                format!("Entropy: ~{:.1} bits ({})", bits, strength_label.0),
+                            );
+                        });
+                    }
+                });
+
+                ui.add_space(5.0);
+
+                let add_button = egui::Button::new(
+                    RichText::new("ADD TO VAULT")
+                        .size(16.0)
+                        .color(Color32::WHITE),
+                )
+                .fill(Color32::RED)
+                .min_size(egui::vec2(150.0, 40.0));
+                ui.vertical_centered(|ui| {
+                    if ui.add(add_button).clicked() {
+                        // Check empties
+                        if self.new_website.trim().is_empty()
+                            || self.new_username.trim().is_empty()
+                            || self.generated_password.trim().is_empty()
+                        {
+                            self.login_error_msg =
+                                "Website, Username, or Password is empty!".into();
+                        } else {
+                            // Check repeated password
+                            for e in &self.vault {
+                                if e.password == self.generated_password {
+                                    self.login_error_msg =
+                                        "Password is already used in vault!".into();
+                                    return;
+                                }
+                            }
+
+                            // We'll treat self.new_tags_str as the single chosen tag, if any
+                            let mut tags = Vec::new();
+                            if !self.new_tags_str.trim().is_empty() {
+                                tags.push(self.new_tags_str.clone());
+                            }
+
+                            let new_entry = VaultEntry {
+                                website: self.new_website.clone(),
+                                username: self.new_username.clone(),
+                                password: self.generated_password.clone(),
+                                tags,
+                            };
+
+                            self.vault.push(new_entry);
+                            self.password_visible.push(false);
+                            self.login_error_msg.clear();
+
+                            // Immediately save
+                            if let Some(ref vault_key) = self.current_vault_key {
+                                if let Some(mh) = &self.master_hash {
+                                    let vault_name =
+                                        self.active_vault_name.clone().unwrap_or_default();
+                                    let _ = save_vault_file(
+                                        &vault_name,
+                                        mh,
+                                        self.pattern_hash.as_deref(),
+                                        vault_key,
+                                        &self.vault,
+                                    );
+                                }
+                            }
+
+                            // Clear fields
+                            self.new_website.zeroize();
+                            self.new_website.clear();
+
+                            self.new_username.zeroize();
+                            self.new_username.clear();
+
+                            self.generated_password.zeroize();
+                            self.generated_password.clear();
+
+                            self.new_tags_str.zeroize();
+                            self.new_tags_str.clear();
+                        }
+                    }
+                });
+                ui.add_space(5.0);
+
+                ui.separator();
+                // (4) "Vault Entries" with tag filter on same line
+                ui.vertical_centered(|ui| {
+                    if let Some(name) = &self.active_vault_name {
+                        ui.heading(
+                            RichText::new(format!("Vault: {name} Entries"))
+                                .size(22.0)
+                                .color(Color32::WHITE),
+                        );
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        ui.add_space(10.0);
+                        egui::ComboBox::from_label("Tag Filter")
+                            .selected_text(if self.tag_filter.is_empty() {
+                                "All".to_string()
+                            } else {
+                                self.tag_filter.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.tag_filter, "".to_string(), "All");
+                                ui.selectable_value(
+                                    &mut self.tag_filter,
+                                    "Social".to_string(),
+                                    "Social",
+                                );
+                                ui.selectable_value(
+                                    &mut self.tag_filter,
+                                    "Work".to_string(),
+                                    "Work",
+                                );
+                                ui.selectable_value(
+                                    &mut self.tag_filter,
+                                    "School".to_string(),
+                                    "School",
+                                );
+                                ui.selectable_value(
+                                    &mut self.tag_filter,
+                                    "Personal".to_string(),
+                                    "Personal",
+                                );
+                                ui.selectable_value(
+                                    &mut self.tag_filter,
+                                    "Extra".to_string(),
+                                    "Extra",
+                                );
+                            });
+                    });
+                });
+
+                ui.separator();
+
+                // Build the list of relevant indices
+                let mut relevant_indices = Vec::new();
+                for (idx, entry) in self.vault.iter().enumerate() {
+                    if self.tag_filter.is_empty() {
+                        relevant_indices.push(idx);
+                    } else {
+                        // if any tag matches ignoring ASCII case
+                        if entry
+                            .tags
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(&self.tag_filter))
+                        {
+                            relevant_indices.push(idx);
+                        }
                     }
                 }
-            });
-        *ui.spacing_mut() = original_spacing;
 
-        if ui.button("Generate Password").clicked() {
-            let user_symbols = self.collect_enabled_symbols();
-            self.generated_password = generate_password(
-                self.length,
-                self.use_lowercase,
-                self.use_uppercase,
-                self.use_digits,
-                &user_symbols,
-            );
-        }
+                let mut delete_index: Option<usize> = None;
+                let user_symbols = self.collect_enabled_symbols();
 
-        ui.separator();
-        ui.label("Generated Password:");
-        ui.monospace(&self.generated_password);
+                // Now show the vault entries
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .max_height(390.0)
+                    .max_width(750.0)
+                    .show(ui, |ui| {
+                        for i in relevant_indices {
+                            ui.group(|ui| {
+                                ui.set_width(750.0);
+                                ui.label(format!("Entry #{}", i + 1));
+                                let entry = &mut self.vault[i];
 
-        // Only show meter if password is non-empty
-        if !self.generated_password.is_empty() {
-            let bits = crate::password::estimate_entropy(&self.generated_password);
-            let strength_label = if bits < 60.0 {
-                ("Weak", Color32::RED)
-            } else if bits <= 100.0 {
-                ("Okay", Color32::YELLOW)
-            } else {
-                ("Strong", Color32::GREEN)
-            };
+                                // Show tags only
+                                ui.horizontal(|ui| {
+                                    ui.label("Tags:");
+                                    let tag_list = entry.tags.join(", ");
+                                    ui.label(tag_list);
+                                });
 
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    strength_label.1,
-                    format!("Entropy: ~{:.1} bits ({})", bits, strength_label.0),
-                );
-            });
-        }
+                                if self.editing_index == Some(i) {
+                                    // Editing UI
+                                    ui.group(|ui| {
+                                        ui.set_max_width(750.0);
+                                        ui.label("Edit Website:");
+                                        ui.text_edit_singleline(&mut self.editing_website);
+                                        ui.label("Edit Username:");
+                                        ui.text_edit_singleline(&mut self.editing_username);
+                                        ui.label("Edit Password:");
+                                        ui.text_edit_singleline(&mut self.editing_password);
+                                    });
 
-        ui.separator();
-        self.show_vault_ui(ui);
+                                    // Show a dynamic meter for typed password
+                                    let e_bits = estimate_entropy(&self.editing_password);
+                                    let e_label = if e_bits < 60.0 {
+                                        ("Weak", Color32::RED)
+                                    } else if e_bits <= 100.0 {
+                                        ("Okay", Color32::YELLOW)
+                                    } else {
+                                        ("Strong", Color32::GREEN)
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(
+                                            e_label.1,
+                                            format!("Entropy: ~{:.1} bits ({})", e_bits, e_label.0),
+                                        );
+                                    });
 
-        ui.separator();
-        if ui.button("Change Master Password").clicked() {
-            self.show_change_pw = true;
-            self.new_master_pw_old_input.clear();
-            self.new_master_pw.clear();
-        }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Save").clicked() {
+                                            entry.website = self.editing_website.clone();
+                                            entry.username = self.editing_username.clone();
+                                            entry.password = self.editing_password.clone();
+                                            self.editing_index = None;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            self.editing_index = None;
+                                        }
+                                    });
+                                } else {
+                                    // Normal display UI
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Website: {}", entry.website));
+                                        // Right-justify copy
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Copy").clicked() {
+                                                    ui.ctx().copy_text(entry.website.clone());
+                                                }
+                                            },
+                                        );
+                                    });
 
-        ui.separator();
-        if ui.button("Change Pattern").clicked() {
-            self.show_change_pattern = true;
-            self.old_password_for_pattern.clear();
-            self.new_pattern_attempt.clear();
-            self.new_pattern_unlocked = false;
-        }
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("Username: {}", entry.username));
+                                        // Right-justify copy
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Copy").clicked() {
+                                                    ui.ctx().copy_text(entry.username.clone());
+                                                }
+                                            },
+                                        );
+                                    });
 
-        ui.separator();
-        if ui.button("Logout").clicked() {
-            if let Some(ref vault_key) = self.current_vault_key {
-                if let Some(mh) = &self.master_hash {
-                    if let Err(e) = save_vault_file(
-                        &vault_name,
-                        mh,
-                        self.pattern_hash.as_deref(),
-                        vault_key,
-                        &self.vault,
-                    ) {
-                        eprintln!("Failed to save on logout: {e}");
+                                    ui.horizontal(|ui| {
+                                        let visible = self.password_visible[i];
+                                        let display_str =
+                                            if visible { &entry.password } else { "***" };
+                                        ui.label(format!("Password: {}", display_str));
+
+                                        // Right-justify eye, then copy
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("Copy").clicked() {
+                                                    ui.ctx().copy_text(entry.password.clone());
+                                                }
+                                                let eye_label =
+                                                    if visible { "🙈" } else { "👁" };
+                                                if ui
+                                                    .button(eye_label)
+                                                    .on_hover_text("Toggle visibility")
+                                                    .clicked()
+                                                {
+                                                    self.password_visible[i] =
+                                                        !self.password_visible[i];
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    // Buttons: Edit, Regenerate, Delete
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Edit").clicked() {
+                                            self.editing_index = Some(i);
+                                            self.editing_website = entry.website.clone();
+                                            self.editing_username = entry.username.clone();
+                                            self.editing_password = entry.password.clone();
+                                        }
+
+                                        if ui
+                                            .button("↻")
+                                            .on_hover_text("Regenerate Password")
+                                            .clicked()
+                                        {
+                                            let old_len = entry.password.len();
+                                            let new_pwd = generate_password(
+                                                old_len,
+                                                self.use_lowercase,
+                                                self.use_uppercase,
+                                                self.use_digits,
+                                                &user_symbols,
+                                            );
+                                            entry.password = new_pwd;
+                                        }
+
+                                        if ui
+                                            .button("Delete")
+                                            .on_hover_text("Remove this entry")
+                                            .clicked()
+                                        {
+                                            delete_index = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                            ui.separator();
+
+                            if delete_index.is_some() {
+                                break;
+                            }
+                        }
+                    });
+
+                // If an entry was marked for deletion, remove it now
+                if let Some(idx) = delete_index {
+                    let ent = &mut self.vault[idx];
+                    ent.website.zeroize();
+                    ent.username.zeroize();
+                    ent.password.zeroize();
+
+                    self.vault.remove(idx);
+                    self.password_visible.remove(idx);
+
+                    if let Some(ref vault_key) = self.current_vault_key {
+                        if let Some(mh) = &self.master_hash {
+                            let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                            let _ = save_vault_file(
+                                &vault_name,
+                                mh,
+                                self.pattern_hash.as_deref(),
+                                vault_key,
+                                &self.vault,
+                            );
+                        }
                     }
                 }
-            }
 
-            // Dismiss editing
-            self.editing_index = None;
-            self.editing_website.zeroize();
-            self.editing_username.zeroize();
-            self.editing_password.zeroize();
+                ui.horizontal(|ui| {
+                    if ui.button("Change Master Password").clicked() {
+                        self.show_change_pw = true;
+                        self.new_master_pw_old_input.clear();
+                        self.new_master_pw.clear();
+                    }
+                    if ui.button("Change Pattern").clicked() {
+                        self.show_change_pattern = true;
+                        self.old_password_for_pattern.clear();
+                        self.new_pattern_attempt.clear();
+                        self.new_pattern_unlocked = false;
+                    }
 
-            // Zeroize text fields
-            self.generated_password.zeroize();
-            self.new_website.zeroize();
-            self.new_username.zeroize();
-            self.master_password_input.zeroize();
-            self.old_password_for_pattern.zeroize();
-            self.new_master_pw_old_input.zeroize();
-            self.new_master_pw.zeroize();
-            self.pattern_attempt.clear();
-            self.is_pattern_unlock = false;
-            self.new_pattern_attempt.clear();
-            self.new_pattern_unlocked = false;
-            self.first_run_password.zeroize();
-            self.first_run_pattern.clear();
-            self.first_run_pattern_unlocked = false;
+                    if ui.button("Logout").clicked() {
+                        if let Some(ref vault_key) = self.current_vault_key {
+                            if let Some(mh) = &self.master_hash {
+                                if let Err(e) = save_vault_file(
+                                    &self.active_vault_name.clone().unwrap_or_default(),
+                                    mh,
+                                    self.pattern_hash.as_deref(),
+                                    vault_key,
+                                    &self.vault,
+                                ) {
+                                    eprintln!("Failed to save on logout: {e}");
+                                }
+                            }
+                        }
+                        // zero everything
+                        self.editing_index = None;
+                        self.editing_website.zeroize();
+                        self.editing_username.zeroize();
+                        self.editing_password.zeroize();
 
-            // Return to manager
-            self.show_vault_manager = true;
-            self.active_vault_name = None;
-            self.is_logged_in = false;
-            self.vault.clear();
-            self.password_visible.clear();
-            self.show_change_pw = false;
-            self.show_change_pattern = false;
-            self.current_vault_key = None;
-            self.failed_attempts = 0;
-            self.login_error_msg.clear();
-        }
+                        self.generated_password.zeroize();
+                        self.new_website.zeroize();
+                        self.new_username.zeroize();
+                        self.master_password_input.zeroize();
+                        self.old_password_for_pattern.zeroize();
+                        self.new_master_pw_old_input.zeroize();
+                        self.new_master_pw.zeroize();
+                        self.pattern_attempt.clear();
+                        self.is_pattern_unlock = false;
+                        self.new_pattern_attempt.clear();
+                        self.new_pattern_unlocked = false;
+                        self.first_run_password.zeroize();
+                        self.first_run_pattern.clear();
+                        self.first_run_pattern_unlocked = false;
+
+                        self.show_vault_manager = true;
+                        self.active_vault_name = None;
+                        self.is_logged_in = false;
+                        self.vault.clear();
+                        self.password_visible.clear();
+                        self.show_change_pw = false;
+                        self.show_change_pattern = false;
+                        self.current_vault_key = None;
+                        self.failed_attempts = 0;
+                        self.login_error_msg.clear();
+                    }
+                });
+            });
     }
 
     fn collect_enabled_symbols(&self) -> Vec<char> {
@@ -667,185 +1060,6 @@ impl QuickPassApp {
             .filter(|s| s.enabled)
             .map(|s| s.sym)
             .collect()
-    }
-
-    fn show_vault_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(
-            RichText::new("Vault Entries")
-                .size(20.0)
-                .color(Color32::DARK_GRAY),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Website:");
-            ui.text_edit_singleline(&mut self.new_website);
-
-            ui.label("Username:");
-            ui.text_edit_singleline(&mut self.new_username);
-
-            if ui.button("Add to Vault").clicked() {
-                let new_entry = VaultEntry {
-                    website: self.new_website.clone(),
-                    username: self.new_username.clone(),
-                    password: self.generated_password.clone(),
-                };
-                self.vault.push(new_entry);
-                self.password_visible.push(false);
-
-                self.new_website.clear();
-                self.new_username.clear();
-                self.generated_password.clear();
-            }
-        });
-
-        ui.separator();
-        while self.password_visible.len() < self.vault.len() {
-            self.password_visible.push(false);
-        }
-
-        let mut delete_index: Option<usize> = None;
-        let user_symbols = self.collect_enabled_symbols();
-
-        for i in 0..self.vault.len() {
-            ui.group(|ui| {
-                ui.label(format!("Entry #{}", i + 1));
-                let entry = &mut self.vault[i];
-
-                if self.editing_index == Some(i) {
-                    // Editing UI
-                    ui.label("Edit Website:");
-                    ui.text_edit_singleline(&mut self.editing_website);
-                    ui.label("Edit Username:");
-                    ui.text_edit_singleline(&mut self.editing_username);
-                    ui.label("Edit Password:");
-                    ui.text_edit_singleline(&mut self.editing_password);
-
-                    // After typing, estimate new strength
-                    let e_bits = crate::password::estimate_entropy(&self.editing_password);
-                    let e_label = if e_bits < 60.0 {
-                        ("Weak", Color32::RED)
-                    } else if e_bits <= 100.0 {
-                        ("Okay", Color32::YELLOW)
-                    } else {
-                        ("Strong", Color32::GREEN)
-                    };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            e_label.1,
-                            format!("Entropy: ~{:.1} bits ({})", e_bits, e_label.0),
-                        );
-                    });
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            entry.website = self.editing_website.clone();
-                            entry.username = self.editing_username.clone();
-                            entry.password = self.editing_password.clone();
-                            self.editing_index = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.editing_index = None;
-                        }
-                    });
-                } else {
-                    // Normal UI
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Website: {}", entry.website));
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(entry.website.clone());
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Username: {}", entry.username));
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(entry.username.clone());
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let visible = self.password_visible[i];
-                        let display_str = if visible { &entry.password } else { "***" };
-                        ui.label(format!("Password: {}", display_str));
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(entry.password.clone());
-                        }
-                        let eye_label = if visible { "🙈" } else { "👁" };
-                        if ui
-                            .button(eye_label)
-                            .on_hover_text("Toggle visibility")
-                            .clicked()
-                        {
-                            self.password_visible[i] = !self.password_visible[i];
-                        }
-                    });
-
-                    // Buttons: Edit, Regenerate, Delete
-                    ui.horizontal(|ui| {
-                        if ui.button("Edit").clicked() {
-                            self.editing_index = Some(i);
-                            self.editing_website = entry.website.clone();
-                            self.editing_username = entry.username.clone();
-                            self.editing_password = entry.password.clone();
-                        }
-
-                        if ui
-                            .button("↻")
-                            .on_hover_text("Regenerate Password")
-                            .clicked()
-                        {
-                            let old_len = entry.password.len();
-                            let new_pwd = generate_password(
-                                old_len,
-                                self.use_lowercase,
-                                self.use_uppercase,
-                                self.use_digits,
-                                &user_symbols,
-                            );
-                            entry.password = new_pwd;
-                        }
-
-                        // Secure Delete
-                        if ui
-                            .button("Delete")
-                            .on_hover_text("Remove this entry from the vault")
-                            .clicked()
-                        {
-                            delete_index = Some(i);
-                        }
-                    });
-                }
-            });
-            ui.separator();
-
-            if delete_index.is_some() {
-                break;
-            }
-        }
-
-        // If an entry was marked for deletion, remove it now
-        if let Some(idx) = delete_index {
-            let ent = &mut self.vault[idx];
-            // zeroize the sensitive fields first
-            ent.website.zeroize();
-            ent.username.zeroize();
-            ent.password.zeroize();
-
-            self.vault.remove(idx);
-            self.password_visible.remove(idx);
-
-            // Re-save the vault after removal
-            if let Some(ref vault_key) = self.current_vault_key {
-                if let Some(mh) = &self.master_hash {
-                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
-                    let _ = save_vault_file(
-                        &vault_name,
-                        mh,
-                        self.pattern_hash.as_deref(),
-                        vault_key,
-                        &self.vault,
-                    );
-                }
-            }
-        }
     }
 
     fn show_change_password_ui(&mut self, ui: &mut egui::Ui) {
@@ -1083,11 +1297,14 @@ impl Drop for QuickPassApp {
         self.new_website.zeroize();
         self.new_username.zeroize();
         self.generated_password.zeroize();
+        self.new_tags_str.zeroize();
+        self.tag_filter.zeroize();
 
         for entry in &mut self.vault {
             entry.website.zeroize();
             entry.username.zeroize();
             entry.password.zeroize();
+            // tags themselves are non-sensitive, but we could also zero them if desired
         }
         self.vault.clear();
 

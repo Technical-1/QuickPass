@@ -6,7 +6,7 @@ build = "src/build.rs"
 
 [dependencies]
 rand = "0.9.0"
-eframe = "0.31.1"
+eframe = { version = "0.31.1", features = ["wgpu"] }
 egui = "0.31.1"
 aes-gcm = "0.10"
 argon2 = "0.5.3"
@@ -17,6 +17,7 @@ directories = "6.0.0"
 once_cell = "1.21.0"
 base64 = "0.22.1"
 chrono = "0.4"
+winit = "0.30.9"
 
 [build-dependencies]
 winres = "0.1"

@@ -24,6 +24,7 @@ pub struct VaultEntry {
     pub website: String,
     pub username: String,
     pub password: String,
+    pub tags: Vec<String>,
 }
 
 /// Metadata stored (encrypted) along with the vault entries
