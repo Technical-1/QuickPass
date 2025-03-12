@@ -6,7 +6,11 @@ use aes_gcm::{
 };
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params, Version,
+};
+use base64::{
+    engine::general_purpose::URL_SAFE_NO_PAD,
+    Engine as _ // trait alias so we can call .encode()/.decode() on the chosen engine
 };
 use directories::ProjectDirs;
 use eframe::{egui, App, Frame, NativeOptions};
@@ -15,23 +19,32 @@ use egui::{Color32, RichText};
 use zeroize::Zeroize;
 
 use serde::{Deserialize, Serialize};
-
-use once_cell::sync::Lazy; // <--- we use Lazy from once_cell
+use once_cell::sync::Lazy;
 use std::error::Error as StdError;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use password::generate_password;
 use rand::RngCore;
 
+// ----------------------------------------
+// Argon2 config: Argon2id with memory/time cost
+// ----------------------------------------
+fn secure_argon2() -> Argon2<'static> {
+    let algorithm = Algorithm::Argon2id;
+    let version = Version::V0x13;
+
+    // Example: memory=65536 KiB (~64MB), iterations=3, parallelism=1
+    let params = Params::new(65536, 2, 2, Some(32))
+        .expect("Invalid Argon2 params");
+    Argon2::new(algorithm, version, params)
+}
+
 // ----------------------
 // Constants / Globals
 // ----------------------
-
-// Instead of OnceLock, we use once_cell::sync::Lazy:
 static GLOBAL_SALT: Lazy<SaltString> = Lazy::new(|| {
-    // Called once, lazily, to produce our global salt
     SaltString::encode_b64(b"MY_APP_STATIC_SALT").unwrap()
 });
 
@@ -39,14 +52,14 @@ fn global_salt() -> &'static SaltString {
     &GLOBAL_SALT
 }
 
-/// For letting the user pick exactly which symbols to include:
+/// Let user pick exactly which symbols to include:
 #[derive(Clone)]
 struct SymbolToggle {
     sym: char,
     enabled: bool,
 }
 
-/// A small struct representing each vault entry
+/// Each vault entry
 #[derive(Clone, Serialize, Deserialize)]
 struct VaultEntry {
     website: String,
@@ -54,27 +67,23 @@ struct VaultEntry {
     password: String,
 }
 
-/// The on-disk format now includes two encryptions of the same `vault_key`:
+/// On-disk format
 #[derive(Serialize, Deserialize)]
 struct EncryptedVaultFile {
-    // Argon2-Hashed credentials
     master_hash: String,
     pattern_hash: Option<String>,
 
-    // The vault key, encrypted with the text-based password:
     encrypted_key_pw: Vec<u8>,
     nonce_pw: Vec<u8>,
 
-    // The same vault key, encrypted with the pattern-based key:
     encrypted_key_pt: Option<Vec<u8>>,
     nonce_pt: Option<Vec<u8>>,
 
-    // Finally, the actual vault data:
     vault_ciphertext: Vec<u8>,
     vault_nonce: Vec<u8>,
 }
 
-/// Main application state
+/// The main app state
 struct QuickPassApp {
     // If true, we show Vault Manager screen
     show_vault_manager: bool,
@@ -85,7 +94,7 @@ struct QuickPassApp {
     is_logged_in: bool,
     vault: Vec<VaultEntry>,
 
-    // The currently unlocked vault key, if any:
+    // The currently unlocked vault key, if any
     current_vault_key: Option<Vec<u8>>,
 
     // Master login input
@@ -105,7 +114,6 @@ struct QuickPassApp {
     use_uppercase: bool,
     use_digits: bool,
     symbol_toggles: Vec<SymbolToggle>,
-
     generated_password: String,
 
     // For adding new vault entries
@@ -114,21 +122,21 @@ struct QuickPassApp {
 
     // Changing master password
     show_change_pw: bool,
-    new_master_pw_old_input: String,   // old password user must confirm
-    new_master_pw: String,            // new password
+    new_master_pw_old_input: String,
+    new_master_pw: String,
 
     // Changing pattern
     show_change_pattern: bool,
-    old_password_for_pattern: String, // must confirm old password
+    old_password_for_pattern: String,
     new_pattern_attempt: Vec<(usize, usize)>,
     new_pattern_unlocked: bool,
 
-    // "Initial Creation" (for newly named vault)
+    // "Initial Creation"
     first_run_password: String,
     first_run_pattern: Vec<(usize, usize)>,
     first_run_pattern_unlocked: bool,
 
-    // login failure tracking
+    // login fails
     failed_attempts: u32,
     login_error_msg: String,
 
@@ -230,6 +238,7 @@ impl Default for QuickPassApp {
     }
 }
 
+// Where multi-vault files live
 fn data_dir() -> PathBuf {
     if let Some(proj_dirs) = ProjectDirs::from("com", "KANFER", "QuickPass") {
         let dir = proj_dirs.data_dir();
@@ -244,7 +253,6 @@ fn vault_file_path(vault_name: &str) -> PathBuf {
     data_dir().join(format!("encrypted_vault_{vault_name}.json"))
 }
 
-/// Scans data_dir for files named "encrypted_vault_*.json"
 fn scan_vaults_in_dir() -> Vec<String> {
     let mut results = Vec::new();
     if let Ok(entries) = fs::read_dir(data_dir()) {
@@ -271,6 +279,9 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+// ------------------------------
+// eframe App Implementation
+// ------------------------------
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -308,11 +319,11 @@ impl App for QuickPassApp {
     }
 }
 
-// ----------------------------------
+// ------------------------------
 // UI Scenes
-// ----------------------------------
+// ------------------------------
 impl QuickPassApp {
-    // Vault Manager
+    /// Vault Manager
     fn show_vault_manager_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Vault Manager").size(28.0).color(Color32::YELLOW));
         ui.label("Manage multiple vaults below.");
@@ -326,9 +337,12 @@ impl QuickPassApp {
                 ui.horizontal(|ui| {
                     ui.label(format!("Vault: {}", vault_name));
                     if ui.button("Open").clicked() {
+                        // Switch to this vault
                         self.active_vault_name = Some(vault_name.clone());
                         self.show_vault_manager = false;
                         self.login_error_msg.clear();
+
+                        // CLEAR old state
                         self.vault.clear();
                         self.password_visible.clear();
                         self.is_logged_in = false;
@@ -336,11 +350,16 @@ impl QuickPassApp {
                         self.pattern_attempt.clear();
                         self.is_pattern_unlock = false;
                         self.failed_attempts = 0;
+
+                        // Also clear the first-run fields in case user tries to "create" again
+                        self.first_run_password.clear();
+                        self.first_run_pattern.clear();
+                        self.first_run_pattern_unlocked = false;
                     }
                     if ui.button("Delete").clicked() {
                         let path = vault_file_path(&vault_name);
                         let _ = fs::remove_file(path);
-                        // re-scan
+                        // Re-scan
                         self.manager_vaults = scan_vaults_in_dir();
                     }
                 });
@@ -350,7 +369,6 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        // Create new vault
         ui.heading("Create a brand-new vault");
         ui.label("Vault Name:");
         ui.text_edit_singleline(&mut self.new_vault_name);
@@ -366,6 +384,8 @@ impl QuickPassApp {
                     self.active_vault_name = Some(self.new_vault_name.clone());
                     self.show_vault_manager = false;
                     self.login_error_msg.clear();
+
+                    // Clear old state
                     self.vault.clear();
                     self.password_visible.clear();
                     self.is_logged_in = false;
@@ -373,6 +393,10 @@ impl QuickPassApp {
                     self.pattern_attempt.clear();
                     self.is_pattern_unlock = false;
                     self.failed_attempts = 0;
+
+                    self.first_run_password.clear();
+                    self.first_run_pattern.clear();
+                    self.first_run_pattern_unlocked = false;
                 }
             }
         }
@@ -380,9 +404,11 @@ impl QuickPassApp {
 
     fn show_initial_creation_ui(&mut self, ui: &mut egui::Ui) {
         let vault_name = self.active_vault_name.clone().unwrap_or_default();
-        ui.heading(RichText::new(format!("Initial Creation for: {}", vault_name))
-            .size(28.0)
-            .color(Color32::RED));
+        ui.heading(
+            RichText::new(format!("Initial Creation for: {}", vault_name))
+                .size(28.0)
+                .color(Color32::RED),
+        );
         ui.label("You must set BOTH a master password AND a pattern for this new vault.");
 
         ui.separator();
@@ -408,11 +434,7 @@ impl QuickPassApp {
             } else {
                 let pattern_hash = pattern_to_string(&self.first_run_pattern);
                 let vault_name = self.active_vault_name.clone().unwrap_or_default();
-                match create_new_vault_file(
-                    &vault_name,
-                    &self.first_run_password,
-                    &pattern_hash,
-                ) {
+                match create_new_vault_file(&vault_name, &self.first_run_password, &pattern_hash) {
                     Ok((mh, ph)) => {
                         self.master_hash = Some(mh);
                         self.pattern_hash = Some(ph);
@@ -440,9 +462,11 @@ impl QuickPassApp {
 
     fn show_login_ui(&mut self, ui: &mut egui::Ui) {
         let vault_name = self.active_vault_name.clone().unwrap_or_default();
-        ui.heading(RichText::new(format!("Welcome to: {}", vault_name))
-            .size(30.0)
-            .color(Color32::GRAY));
+        ui.heading(
+            RichText::new(format!("Welcome to: {}", vault_name))
+                .size(30.0)
+                .color(Color32::GRAY),
+        );
         ui.label("Enter your master password:");
         ui.add(egui::TextEdit::singleline(&mut self.master_password_input).password(true));
 
@@ -471,7 +495,11 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        ui.label(RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)").size(20.0).color(Color32::GRAY));
+        ui.label(
+            RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)")
+                .size(20.0)
+                .color(Color32::GRAY),
+        );
         self.show_pattern_lock_login(ui);
 
         if self.is_pattern_unlock {
@@ -532,8 +560,11 @@ impl QuickPassApp {
 
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
         let vault_name = self.active_vault_name.clone().unwrap_or_default();
-        ui.heading(RichText::new(format!("QuickPass - Vault: {}", vault_name))
-            .size(30.0).color(Color32::GRAY));
+        ui.heading(
+            RichText::new(format!("QuickPass - Vault: {}", vault_name))
+                .size(30.0)
+                .color(Color32::GRAY),
+        );
 
         ui.horizontal(|ui| {
             ui.label("Length:");
@@ -660,20 +691,20 @@ impl QuickPassApp {
             self.password_visible.push(false);
         }
 
+        let mut delete_index: Option<usize> = None;
         let user_symbols = self.collect_enabled_symbols();
 
         for i in 0..self.vault.len() {
-            let entry = &mut self.vault[i];
             ui.group(|ui| {
                 ui.label(format!("Entry #{}", i + 1));
+                let entry = &mut self.vault[i];
 
                 if self.editing_index == Some(i) {
+                    // Editing UI
                     ui.label("Edit Website:");
                     ui.text_edit_singleline(&mut self.editing_website);
-
                     ui.label("Edit Username:");
                     ui.text_edit_singleline(&mut self.editing_username);
-
                     ui.label("Edit Password:");
                     ui.text_edit_singleline(&mut self.editing_password);
 
@@ -689,6 +720,7 @@ impl QuickPassApp {
                         }
                     });
                 } else {
+                    // Normal UI
                     ui.horizontal(|ui| {
                         ui.label(format!("Website: {}", entry.website));
                         if ui.button("Copy").clicked() {
@@ -709,11 +741,15 @@ impl QuickPassApp {
                             ui.ctx().copy_text(entry.password.clone());
                         }
                         let eye_label = if visible { "🙈" } else { "👁" };
-                        if ui.button(eye_label).on_hover_text("Toggle visibility").clicked() {
+                        if ui.button(eye_label)
+                            .on_hover_text("Toggle visibility")
+                            .clicked()
+                        {
                             self.password_visible[i] = !self.password_visible[i];
                         }
                     });
 
+                    // Buttons: Edit, Regenerate, Delete
                     ui.horizontal(|ui| {
                         if ui.button("Edit").clicked() {
                             self.editing_index = Some(i);
@@ -733,10 +769,48 @@ impl QuickPassApp {
                             );
                             entry.password = new_pwd;
                         }
+
+                        // Secure Delete button
+                        if ui.button("Delete")
+                            .on_hover_text("Remove this entry from the vault")
+                            .clicked()
+                        {
+                            delete_index = Some(i);
+                        }
                     });
                 }
             });
             ui.separator();
+
+            if delete_index.is_some() {
+                break;
+            }
+        }
+
+        // If an entry was marked for deletion, remove it now
+        if let Some(idx) = delete_index {
+            let ent = &mut self.vault[idx];
+            // zeroize the sensitive fields first
+            ent.website.zeroize();
+            ent.username.zeroize();
+            ent.password.zeroize();
+
+            self.vault.remove(idx);
+            self.password_visible.remove(idx);
+
+            // Re-save the vault after removal
+            if let Some(ref vault_key) = self.current_vault_key {
+                if let Some(mh) = &self.master_hash {
+                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                    let _ = save_vault_file(
+                        &vault_name,
+                        mh,
+                        self.pattern_hash.as_deref(),
+                        vault_key,
+                        &self.vault,
+                    );
+                }
+            }
         }
     }
 
@@ -940,36 +1014,65 @@ impl QuickPassApp {
     }
 }
 
-// ----------------------------------
-// HELPER FUNCTIONS
-// ----------------------------------
+// ------------------------------
+// I/O with base64 for obfuscation
+// ------------------------------
+fn write_encrypted_vault_file(path: impl AsRef<Path>, file_data: &EncryptedVaultFile)
+    -> Result<(), Box<dyn StdError>>
+{
+    // Convert to JSON
+    let json = serde_json::to_string_pretty(file_data)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
-/// Create a new vault file
+    // Base64-encode
+    let encoded = URL_SAFE_NO_PAD.encode(json);
+    fs::write(path, encoded)?;
+    Ok(())
+}
+
+fn read_encrypted_vault_file(path: impl AsRef<Path>)
+    -> Result<EncryptedVaultFile, Box<dyn StdError>>
+{
+    let encoded = fs::read_to_string(path)?;
+    let decoded_bytes = URL_SAFE_NO_PAD.decode(encoded.trim())
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+
+    let file: EncryptedVaultFile = serde_json::from_slice(&decoded_bytes)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+    Ok(file)
+}
+
+// ------------------------------
+// CREATE / LOAD / SAVE
+// with Argon2 error -> IoError
+// ------------------------------
 fn create_new_vault_file(
     vault_name: &str,
     master_password: &str,
     pattern_hash_str: &str,
-) -> Result<(String, String), Box<dyn StdError>> {
+) -> Result<(String, String), Box<dyn StdError>>
+{
     let path = vault_file_path(vault_name);
-
-    let argon2 = Argon2::default();
+    let argon2 = secure_argon2();
     let salt_str = global_salt();
 
     let master_hash = argon2
         .hash_password(master_password.as_bytes(), salt_str)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?
         .to_string();
 
     let hashed_pattern = argon2
         .hash_password(pattern_hash_str.as_bytes(), salt_str)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?
         .to_string();
 
     let mut vault_key = [0u8; 32];
     rand::rng().fill_bytes(&mut vault_key);
 
-    let (encrypted_key_pw, nonce_pw) = encrypt_with_derived_key(&vault_key, master_password.as_bytes())?;
-    let (encrypted_key_pt, nonce_pt) = encrypt_with_derived_key(&vault_key, pattern_hash_str.as_bytes())?;
+    let (encrypted_key_pw, nonce_pw) =
+        encrypt_with_derived_key(&vault_key, master_password.as_bytes())?;
+    let (encrypted_key_pt, nonce_pt) =
+        encrypt_with_derived_key(&vault_key, pattern_hash_str.as_bytes())?;
 
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(&[], &vault_key)?;
     vault_key.zeroize();
@@ -985,38 +1088,50 @@ fn create_new_vault_file(
         vault_nonce,
     };
 
-    let serialized = serde_json::to_string_pretty(&file_data)?;
-    fs::write(path, serialized)?;
+    write_encrypted_vault_file(path, &file_data)?;
 
-    Ok((file_data.master_hash.clone(), file_data.pattern_hash.clone().unwrap()))
+    Ok((
+        file_data.master_hash.clone(),
+        file_data.pattern_hash.clone().unwrap(),
+    ))
 }
 
 fn load_vault_key_only(
     vault_name: &str,
     master_password: &str,
     pattern: Option<&[u8]>,
-) -> Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>> {
-    let path = vault_file_path(vault_name);
-    let data = fs::read_to_string(&path)?;
-    let file: EncryptedVaultFile = serde_json::from_str(&data)?;
+) -> Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>>
+{
+    let file = read_encrypted_vault_file(vault_file_path(vault_name))?;
+    let argon2 = secure_argon2();
 
     if let Some(patt_bytes) = pattern {
-        let phash = file.pattern_hash.as_ref().ok_or("No pattern hash stored!")?;
-        let parsed_hash = PasswordHash::new(phash).map_err(|e| e.to_string())?;
-        Argon2::default()
+        let phash = file
+            .pattern_hash
+            .as_ref()
+            .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No pattern hash stored!"))?;
+        let parsed_hash = PasswordHash::new(phash)
+            .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+        argon2
             .verify_password(patt_bytes, &parsed_hash)
             .map_err(|_| IoError::new(ErrorKind::InvalidData, "Pattern mismatch"))?;
 
-        let enc_key_pt = file.encrypted_key_pt.as_ref().ok_or("No encrypted_key_pt!")?;
-        let nonce_pt = file.nonce_pt.as_ref().ok_or("No nonce_pt!")?;
+        let enc_key_pt = file
+            .encrypted_key_pt
+            .as_ref()
+            .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No encrypted_key_pt!"))?;
+        let nonce_pt = file
+            .nonce_pt
+            .as_ref()
+            .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No nonce_pt!"))?;
 
         let vault_key = decrypt_with_derived_key(enc_key_pt, nonce_pt, patt_bytes)?;
-        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
+        Ok((file.master_hash, file.pattern_hash, vault_key))
     } else {
-        // text-based
         if !master_password.is_empty() {
-            let parsed_hash = PasswordHash::new(&file.master_hash).map_err(|e| e.to_string())?;
-            Argon2::default()
+            let parsed_hash = PasswordHash::new(&file.master_hash)
+                .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+            argon2
                 .verify_password(master_password.as_bytes(), &parsed_hash)
                 .map_err(|_| IoError::new(ErrorKind::InvalidData, "Master password mismatch"))?;
         }
@@ -1025,15 +1140,16 @@ fn load_vault_key_only(
             &file.nonce_pw,
             master_password.as_bytes(),
         )?;
-        Ok((file.master_hash.clone(), file.pattern_hash.clone(), vault_key))
+        Ok((file.master_hash, file.pattern_hash, vault_key))
     }
 }
 
-fn load_vault_data(vault_name: &str, vault_key: &[u8]) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
-    let path = vault_file_path(vault_name);
-    let data = fs::read_to_string(&path)?;
-    let file: EncryptedVaultFile = serde_json::from_str(&data)?;
-
+fn load_vault_data(
+    vault_name: &str,
+    vault_key: &[u8]
+) -> Result<Vec<VaultEntry>, Box<dyn StdError>>
+{
+    let file = read_encrypted_vault_file(vault_file_path(vault_name))?;
     let vault = decrypt_vault_data((&file.vault_nonce, &file.vault_ciphertext), vault_key)?;
     Ok(vault)
 }
@@ -1044,79 +1160,71 @@ fn save_vault_file(
     pattern_hash: Option<&str>,
     vault_key: &[u8],
     vault: &[VaultEntry],
-) -> Result<(), Box<dyn StdError>> {
-    let path = vault_file_path(vault_name);
-    let data = fs::read_to_string(&path)?;
-    let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
-
+) -> Result<(), Box<dyn StdError>>
+{
+    let mut file = read_encrypted_vault_file(vault_file_path(vault_name))?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
+
     file.vault_nonce = vault_nonce;
     file.vault_ciphertext = vault_ciphertext;
-
     file.master_hash = master_hash.to_string();
     file.pattern_hash = pattern_hash.map(|s| s.to_string());
 
-    let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(path, serialized)?;
+    write_encrypted_vault_file(vault_file_path(vault_name), &file)?;
     Ok(())
 }
 
 fn update_master_password_with_key(
-    _vault_name: &str,
+    vault_name: &str,
     _old_password: &str,
     new_password: &str,
     vault_key: &[u8],
     vault: &[VaultEntry],
     pattern_hash: Option<&str>,
-) -> Result<String, Box<dyn StdError>> {
-    let path = vault_file_path(_vault_name);
-
-    let argon2 = Argon2::default();
+) -> Result<String, Box<dyn StdError>>
+{
+    let mut file = read_encrypted_vault_file(vault_file_path(vault_name))?;
+    let argon2 = secure_argon2();
     let salt_str = global_salt();
     let new_hash = argon2
         .hash_password(new_password.as_bytes(), salt_str)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?
         .to_string();
 
-    let (encrypted_key_pw, nonce_pw) = encrypt_with_derived_key(vault_key, new_password.as_bytes())?;
+    let (encrypted_key_pw, nonce_pw) =
+        encrypt_with_derived_key(vault_key, new_password.as_bytes())?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
 
-    let data = fs::read_to_string(&path)?;
-    let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
     file.master_hash = new_hash.clone();
     file.pattern_hash = pattern_hash.map(|s| s.to_string());
-
     file.encrypted_key_pw = encrypted_key_pw;
     file.nonce_pw = nonce_pw;
     file.vault_nonce = vault_nonce;
     file.vault_ciphertext = vault_ciphertext;
 
-    let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(path, serialized)?;
+    write_encrypted_vault_file(vault_file_path(vault_name), &file)?;
     Ok(new_hash)
 }
 
 fn update_pattern_with_key(
-    _vault_name: &str,
+    vault_name: &str,
     _old_password: &str,
     new_pattern_str: &str,
     vault_key: &[u8],
     vault: &[VaultEntry],
-) -> Result<String, Box<dyn StdError>> {
-    let path = vault_file_path(_vault_name);
-
-    let argon2 = Argon2::default();
+) -> Result<String, Box<dyn StdError>>
+{
+    let mut file = read_encrypted_vault_file(vault_file_path(vault_name))?;
+    let argon2 = secure_argon2();
     let salt_str = global_salt();
     let new_ph = argon2
         .hash_password(new_pattern_str.as_bytes(), salt_str)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?
         .to_string();
 
-    let (encrypted_key_pt, nonce_pt) = encrypt_with_derived_key(vault_key, new_pattern_str.as_bytes())?;
+    let (encrypted_key_pt, nonce_pt) =
+        encrypt_with_derived_key(vault_key, new_pattern_str.as_bytes())?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_data(vault, vault_key)?;
-
-    let data = fs::read_to_string(&path)?;
-    let mut file: EncryptedVaultFile = serde_json::from_str(&data)?;
 
     file.pattern_hash = Some(new_ph.clone());
     file.encrypted_key_pt = Some(encrypted_key_pt);
@@ -1124,12 +1232,11 @@ fn update_pattern_with_key(
     file.vault_nonce = vault_nonce;
     file.vault_ciphertext = vault_ciphertext;
 
-    let serialized = serde_json::to_string_pretty(&file)?;
-    fs::write(path, serialized)?;
+    write_encrypted_vault_file(vault_file_path(vault_name), &file)?;
     Ok(new_ph)
 }
 
-/// Convert the user-chosen pattern array into a string like "0,0-0,1-1,1-2,2"
+// pattern helper
 fn pattern_to_string(pattern: &[(usize, usize)]) -> String {
     pattern
         .iter()
@@ -1138,21 +1245,28 @@ fn pattern_to_string(pattern: &[(usize, usize)]) -> String {
         .join("-")
 }
 
-// Key Derivation, Encryption, Decryption
+// key derivation
 fn derive_key_from_input(input: &[u8]) -> [u8; 32] {
-    let argon2 = Argon2::default();
+    let argon2 = secure_argon2();
     let mut salt_buf = [0u8; 16];
     let _ = global_salt().decode_b64(&mut salt_buf);
 
     let mut key = [0u8; 32];
-    let _ = argon2.hash_password_into(input, &salt_buf, &mut key);
+    let _ = argon2
+        .hash_password_into(input, &salt_buf, &mut key)
+        .map_err(|_e| {
+            IoError::new(ErrorKind::InvalidData, "hash_password_into error")
+        })
+        .ok();
     key
 }
 
+// encryption / decryption
 fn encrypt_with_derived_key(
     plaintext: &[u8],
     input: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn StdError>> {
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn StdError>>
+{
     let key_bytes = derive_key_from_input(input);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(cipher_key);
@@ -1162,7 +1276,9 @@ fn encrypt_with_derived_key(
     rng.fill_bytes(&mut nonce_arr);
 
     let nonce = Nonce::from_slice(&nonce_arr);
-    let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())?;
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
     let mut kb = key_bytes;
     kb.zeroize();
@@ -1174,13 +1290,16 @@ fn decrypt_with_derived_key(
     ciphertext: &[u8],
     nonce_bytes: &[u8],
     input: &[u8],
-) -> Result<Vec<u8>, Box<dyn StdError>> {
+) -> Result<Vec<u8>, Box<dyn StdError>>
+{
     let key_bytes = derive_key_from_input(input);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(cipher_key);
 
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
     let mut kb = key_bytes;
     kb.zeroize();
@@ -1191,17 +1310,24 @@ fn decrypt_with_derived_key(
 fn encrypt_vault_data(
     vault: &[VaultEntry],
     vault_key: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn StdError>> {
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn StdError>>
+{
     let cipher_key = Key::<Aes256Gcm>::from_slice(vault_key);
     let cipher = Aes256Gcm::new(cipher_key);
 
-    let json = serde_json::to_vec(vault)?;
+    let json = serde_json::to_vec(vault)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+
     let mut rng = rand::rng();
     let mut nonce_arr = [0u8; 12];
     rng.fill_bytes(&mut nonce_arr);
 
     let nonce = Nonce::from_slice(&nonce_arr);
-    let ciphertext = cipher.encrypt(nonce, json.as_slice()).map_err(|e| e.to_string())?;
+
+    // FIX: pass `json.as_slice()` rather than `&json`
+    let ciphertext = cipher
+        .encrypt(nonce, json.as_slice())
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
     Ok((nonce_arr.to_vec(), ciphertext))
 }
@@ -1209,13 +1335,50 @@ fn encrypt_vault_data(
 fn decrypt_vault_data(
     (nonce_bytes, ciphertext): (&[u8], &[u8]),
     vault_key: &[u8],
-) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+) -> Result<Vec<VaultEntry>, Box<dyn StdError>>
+{
     let cipher_key = Key::<Aes256Gcm>::from_slice(vault_key);
     let cipher = Aes256Gcm::new(cipher_key);
 
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())?;
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
 
-    let vault: Vec<VaultEntry> = serde_json::from_slice(&plaintext)?;
+    let vault: Vec<VaultEntry> = serde_json::from_slice(&plaintext)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
     Ok(vault)
+}
+
+// Secure memory clearing on Drop
+impl Drop for QuickPassApp {
+    fn drop(&mut self) {
+        // zeroize sensitive fields
+        self.master_password_input.zeroize();
+        self.old_password_for_pattern.zeroize();
+        self.new_master_pw_old_input.zeroize();
+        self.new_master_pw.zeroize();
+
+        self.new_website.zeroize();
+        self.new_username.zeroize();
+        self.generated_password.zeroize();
+
+        for entry in &mut self.vault {
+            entry.website.zeroize();
+            entry.username.zeroize();
+            entry.password.zeroize();
+        }
+        self.vault.clear();
+
+        self.first_run_password.zeroize();
+        self.first_run_pattern.clear();
+
+        self.editing_website.zeroize();
+        self.editing_username.zeroize();
+        self.editing_password.zeroize();
+
+        if let Some(ref mut k) = self.current_vault_key {
+            k.zeroize();
+        }
+    }
 }

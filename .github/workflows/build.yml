@@ -161,7 +161,7 @@ jobs:
           path: target/release/QuickPass.dmg
           overwrite: true
 
-  # ------------------------------------------------
+   # ------------------------------------------------
   # 3) Release job
   # ------------------------------------------------
   release:
@@ -187,7 +187,6 @@ jobs:
           name: QuickPass-macOS-dmg
           path: ./dist
 
-      # Provide GITHUB_TOKEN via env, not 'token:' input
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
