@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*.*.*"
+permissions:
+  contents: write
   
 
 jobs:
@@ -201,6 +203,8 @@ jobs:
 
       - name: Upload Windows
         uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ./dist/QuickPass.exe
@@ -209,6 +213,8 @@ jobs:
 
       - name: Upload Linux
         uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ./dist/QuickPass
@@ -217,6 +223,8 @@ jobs:
 
       - name: Upload mac dmg
         uses: actions/upload-release-asset@v1
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ./dist/QuickPass.dmg
