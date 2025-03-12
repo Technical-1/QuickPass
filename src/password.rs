@@ -5,6 +5,66 @@ use rand::Rng;
 ///
 /// If `use_lowercase`, `use_uppercase`, and `use_digits` are all false
 /// and `user_symbols` is empty, we'll fallback to a default alphanumeric set.
+/// A rough approximation of password entropy (in bits).
+/// We'll treat each character set used as a separate factor, or fallback to length-based approach.
+pub fn estimate_entropy(pwd: &str) -> f64 {
+    if pwd.is_empty() {
+        return 0.0;
+    }
+    // We'll do a naive approach:
+    // 1) Identify which categories are present: lowercase, uppercase, digits, symbols
+    // 2) Sum up their possible char sets
+    // 3) bits = length * log2(character_set_size).
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut has_digit = false;
+    let mut has_symbol = false;
+
+    for c in pwd.chars() {
+        if c.is_ascii_lowercase() {
+            has_lower = true;
+        } else if c.is_ascii_uppercase() {
+            has_upper = true;
+        } else if c.is_ascii_digit() {
+            has_digit = true;
+        } else {
+            has_symbol = true;
+        }
+    }
+
+    let mut char_space = 0;
+    if has_lower {
+        char_space += 26;
+    }
+    if has_upper {
+        char_space += 26;
+    }
+    if has_digit {
+        char_space += 10;
+    }
+    if has_symbol {
+        // We'll guess a ~30 typical symbol set
+        char_space += 30;
+    }
+    // If we didn't identify a category, fallback to the "unique chars in the password" approach
+    if char_space == 0 {
+        // fallback to unique chars
+        use std::collections::HashSet;
+        let unique: HashSet<char> = pwd.chars().collect();
+        char_space = unique.len();
+        // if it is still 0 or 1, fallback to 1 => 1 bit or so
+        if char_space < 2 {
+            char_space = 2;
+        }
+    }
+
+    let length = pwd.chars().count() as f64;
+    let space = char_space as f64;
+    // entropy in bits = length * log2(space)
+    let approx_bits = length * space.log2();
+    approx_bits
+}
+
 pub fn generate_password(
     length: usize,
     use_lowercase: bool,

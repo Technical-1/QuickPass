@@ -311,8 +311,6 @@ pub fn load_vault_data_decrypted(
     Ok(data)
 }
 
-
-
 /// Update the last_accessed time in the vault (and optionally the entries) by re-encrypting the file.
 pub fn update_last_accessed_in_vault(
     vault_name: &str,

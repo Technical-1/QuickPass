@@ -185,7 +185,9 @@ impl App for QuickPassApp {
             } else if !self.is_logged_in {
                 // Before calling show_login_ui, read the EncryptedVaultFile to retrieve security_level
                 if file_exists {
-                    if let Ok(ef) = crate::vault::read_encrypted_vault_file(vault_file_path(&vault_name)) {
+                    if let Ok(ef) =
+                        crate::vault::read_encrypted_vault_file(vault_file_path(&vault_name))
+                    {
                         // We override our current self.security_level with the stored one
                         self.security_level = ef.security_level;
                     }
@@ -226,33 +228,42 @@ impl QuickPassApp {
                 ui.horizontal(|ui| {
                     // Load the EncryptedVaultFile top-level, read its unencrypted last_accessed_plaintext
                     use crate::vault::read_encrypted_vault_file;
-                    let maybe_timestamp = if let Ok(ef) = read_encrypted_vault_file(vault_file_path(&vault_name)) {
-                        ef.last_accessed_plaintext.clone().unwrap_or_else(|| "Never".into())
-                    } else {
-                        "Never".into()
-                    };
+                    let maybe_timestamp =
+                        if let Ok(ef) = read_encrypted_vault_file(vault_file_path(&vault_name)) {
+                            ef.last_accessed_plaintext
+                                .clone()
+                                .unwrap_or_else(|| "Never".into())
+                        } else {
+                            "Never".into()
+                        };
                     ui.label(format!("Vault: {vault_name}"));
                     ui.label(format!("(Last Accessed: {maybe_timestamp})"));
 
                     if ui.button("Open").clicked() {
+                        // Zeroize text fields first
+                        self.generated_password.zeroize();
+                        self.new_website.zeroize();
+                        self.new_username.zeroize();
+                        self.master_password_input.zeroize();
+                        self.old_password_for_pattern.zeroize();
+                        self.new_master_pw_old_input.zeroize();
+                        self.new_master_pw.zeroize();
+                        self.pattern_attempt.clear();
+                        self.is_pattern_unlock = false;
+                        self.new_pattern_attempt.clear();
+                        self.new_pattern_unlocked = false;
+                        self.first_run_password.zeroize();
+                        self.first_run_pattern.clear();
+                        self.first_run_pattern_unlocked = false;
+                        self.failed_attempts = 0;
+                        self.login_error_msg.clear();
+
                         // Switch
                         self.active_vault_name = Some(vault_name.clone());
                         self.show_vault_manager = false;
-                        self.login_error_msg.clear();
-
-                        // CLEAR old state
                         self.vault.clear();
                         self.password_visible.clear();
                         self.is_logged_in = false;
-                        self.master_password_input.clear();
-                        self.pattern_attempt.clear();
-                        self.is_pattern_unlock = false;
-                        self.failed_attempts = 0;
-
-                        // Also clear the first-run fields in case user tries to "create" again
-                        self.first_run_password.clear();
-                        self.first_run_pattern.clear();
-                        self.first_run_pattern_unlocked = false;
                     }
                     if ui.button("Delete").clicked() {
                         let path = vault_file_path(&vault_name);
@@ -482,17 +493,35 @@ impl QuickPassApp {
 
         ui.separator();
         if ui.button("Return to Vault Manager").clicked() {
+            // Dismiss editing
+            self.editing_index = None;
+            self.editing_website.zeroize();
+            self.editing_username.zeroize();
+            self.editing_password.zeroize();
+            // Zeroize text fields
+            self.generated_password.zeroize();
+            self.new_website.zeroize();
+            self.new_username.zeroize();
+            self.master_password_input.zeroize();
+            self.old_password_for_pattern.zeroize();
+            self.new_master_pw_old_input.zeroize();
+            self.new_master_pw.zeroize();
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+            self.new_pattern_attempt.clear();
+            self.new_pattern_unlocked = false;
+            self.first_run_password.zeroize();
+            self.first_run_pattern.clear();
+            self.first_run_pattern_unlocked = false;
+            self.login_error_msg.clear();
+            self.failed_attempts = 0;
+
+            // Return to manager
             self.show_vault_manager = true;
-            // Clear state
             self.active_vault_name = None;
             self.is_logged_in = false;
             self.vault.clear();
             self.password_visible.clear();
-            self.master_password_input.clear();
-            self.pattern_attempt.clear();
-            self.is_pattern_unlock = false;
-            self.login_error_msg.clear();
-            self.failed_attempts = 0;
         }
     }
 
@@ -543,6 +572,25 @@ impl QuickPassApp {
         ui.label("Generated Password:");
         ui.monospace(&self.generated_password);
 
+        // Only show meter if password is non-empty
+        if !self.generated_password.is_empty() {
+            let bits = crate::password::estimate_entropy(&self.generated_password);
+            let strength_label = if bits < 60.0 {
+                ("Weak", Color32::RED)
+            } else if bits <= 100.0 {
+                ("Okay", Color32::YELLOW)
+            } else {
+                ("Strong", Color32::GREEN)
+            };
+
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    strength_label.1,
+                    format!("Entropy: ~{:.1} bits ({})", bits, strength_label.0),
+                );
+            });
+        }
+
         ui.separator();
         self.show_vault_ui(ui);
 
@@ -577,23 +625,39 @@ impl QuickPassApp {
                 }
             }
 
+            // Dismiss editing
+            self.editing_index = None;
+            self.editing_website.zeroize();
+            self.editing_username.zeroize();
+            self.editing_password.zeroize();
+
+            // Zeroize text fields
+            self.generated_password.zeroize();
+            self.new_website.zeroize();
+            self.new_username.zeroize();
+            self.master_password_input.zeroize();
+            self.old_password_for_pattern.zeroize();
+            self.new_master_pw_old_input.zeroize();
+            self.new_master_pw.zeroize();
+            self.pattern_attempt.clear();
+            self.is_pattern_unlock = false;
+            self.new_pattern_attempt.clear();
+            self.new_pattern_unlocked = false;
+            self.first_run_password.zeroize();
+            self.first_run_pattern.clear();
+            self.first_run_pattern_unlocked = false;
+
             // Return to manager
             self.show_vault_manager = true;
             self.active_vault_name = None;
             self.is_logged_in = false;
             self.vault.clear();
             self.password_visible.clear();
-            self.master_password_input.clear();
-            self.pattern_attempt.clear();
-            self.is_pattern_unlock = false;
             self.show_change_pw = false;
-            self.new_master_pw_old_input.clear();
-            self.new_master_pw.clear();
             self.show_change_pattern = false;
-            self.old_password_for_pattern.clear();
-            self.new_pattern_attempt.clear();
-            self.new_pattern_unlocked = false;
             self.current_vault_key = None;
+            self.failed_attempts = 0;
+            self.login_error_msg.clear();
         }
     }
 
@@ -655,6 +719,22 @@ impl QuickPassApp {
                     ui.text_edit_singleline(&mut self.editing_username);
                     ui.label("Edit Password:");
                     ui.text_edit_singleline(&mut self.editing_password);
+
+                    // After typing, estimate new strength
+                    let e_bits = crate::password::estimate_entropy(&self.editing_password);
+                    let e_label = if e_bits < 60.0 {
+                        ("Weak", Color32::RED)
+                    } else if e_bits <= 100.0 {
+                        ("Okay", Color32::YELLOW)
+                    } else {
+                        ("Strong", Color32::GREEN)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            e_label.1,
+                            format!("Entropy: ~{:.1} bits ({})", e_bits, e_label.0),
+                        );
+                    });
 
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
