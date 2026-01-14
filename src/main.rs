@@ -18,7 +18,7 @@ fn main() {
             .with_inner_size(initial_size)
             .with_min_inner_size(min_size)
             .with_max_inner_size(max_size)
-            .with_resizable(false), // allow resizing (true by default, but explicit here)
+            .with_resizable(true), // allow resizing within min/max bounds
         ..Default::default()
     };
 

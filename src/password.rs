@@ -1,5 +1,35 @@
 use rand::Rng;
 
+/// Validates master password strength requirements.
+/// Returns Ok(()) if valid, or Err with a list of requirements not met.
+pub fn validate_master_password(password: &str) -> Result<(), Vec<&'static str>> {
+    let mut errors = Vec::new();
+
+    if password.len() < 8 {
+        errors.push("Must be at least 8 characters");
+    }
+
+    let has_lowercase = password.chars().any(|c| c.is_ascii_lowercase());
+    let has_uppercase = password.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+
+    if !has_lowercase {
+        errors.push("Must contain a lowercase letter");
+    }
+    if !has_uppercase {
+        errors.push("Must contain an uppercase letter");
+    }
+    if !has_digit {
+        errors.push("Must contain a digit");
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Generates a password with options for lowercase, uppercase, digits,
 /// and a user-provided list of symbols (user_symbols).
 ///

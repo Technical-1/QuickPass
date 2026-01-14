@@ -1,15 +1,23 @@
 use eframe::{App, Frame, egui};
 use egui::{Color32, RichText};
+use std::time::Instant;
 use zeroize::Zeroize;
 
 use crate::manager::{scan_vaults_in_dir, vault_file_path};
-use crate::password::{estimate_entropy, generate_password};
+use crate::password::{estimate_entropy, generate_password, validate_master_password};
 use crate::security::SecurityLevel;
 use crate::vault::{
-    VaultEntry, create_new_vault_file, load_vault_data_decrypted, load_vault_key_only,
-    pattern_to_string, save_vault_file, update_last_accessed_in_vault,
+    VaultEntry, create_new_vault_file, export_encrypted_backup, export_to_csv,
+    import_encrypted_backup, load_vault_data_decrypted, load_vault_key_only,
+    pattern_to_string, save_vault_file, update_custom_tags, update_last_accessed_in_vault,
     update_master_password_with_key, update_pattern_with_key,
 };
+
+/// Clipboard clear timeout in seconds
+const CLIPBOARD_CLEAR_SECONDS: u64 = 30;
+
+/// Auto-lock timeout in seconds (5 minutes)
+const AUTO_LOCK_SECONDS: u64 = 300;
 
 #[derive(Clone)]
 pub struct SymbolToggle {
@@ -55,6 +63,12 @@ pub struct QuickPassApp {
     pub new_username: String,
     pub new_tags_str: String, // typed tags for new entry
     pub tag_filter: String,   // filter string
+    pub search_query: String, // search by website/username
+
+    // Custom tags management
+    pub custom_tags: Vec<String>,
+    pub new_custom_tag: String,
+    pub show_tag_manager: bool,
 
     // Changing master password
     pub show_change_pw: bool,
@@ -88,6 +102,24 @@ pub struct QuickPassApp {
     // For the Vault Manager
     pub new_vault_name: String,
     pub manager_vaults: Vec<String>,
+
+    // Clipboard auto-clear
+    pub clipboard_copy_time: Option<Instant>,
+    pub clipboard_copy_type: Option<String>,
+
+    // Confirmation dialogs
+    pub pending_delete_entry: Option<usize>,
+    pub pending_delete_vault: Option<String>,
+
+    // Auto-lock timeout tracking
+    pub last_activity_time: Instant,
+
+    // Export/Import state
+    pub show_export_dialog: bool,
+    pub export_result: Option<String>,
+    pub show_import_dialog: bool,
+    pub import_data: String,
+    pub import_error: Option<String>,
 }
 
 impl Default for QuickPassApp {
@@ -122,6 +154,11 @@ impl Default for QuickPassApp {
             new_username: String::new(),
             new_tags_str: String::new(),
             tag_filter: String::new(),
+            search_query: String::new(),
+
+            custom_tags: Vec::new(),
+            new_custom_tag: String::new(),
+            show_tag_manager: false,
 
             show_change_pw: false,
             new_master_pw_old_input: String::new(),
@@ -148,6 +185,20 @@ impl Default for QuickPassApp {
 
             new_vault_name: String::new(),
             manager_vaults,
+
+            clipboard_copy_time: None,
+            clipboard_copy_type: None,
+
+            pending_delete_entry: None,
+            pending_delete_vault: None,
+
+            last_activity_time: Instant::now(),
+
+            show_export_dialog: false,
+            export_result: None,
+            show_import_dialog: false,
+            import_data: String::new(),
+            import_error: None,
         }
     }
 }
@@ -166,7 +217,87 @@ fn build_default_symbol_toggles() -> Vec<SymbolToggle> {
 
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Check clipboard auto-clear
+        if let Some(copy_time) = self.clipboard_copy_time {
+            if copy_time.elapsed().as_secs() >= CLIPBOARD_CLEAR_SECONDS {
+                ctx.copy_text(String::new());
+                self.clipboard_copy_time = None;
+                self.clipboard_copy_type = None;
+            }
+        }
+
+        // Check auto-lock timeout (only when logged in)
+        if self.is_logged_in && self.last_activity_time.elapsed().as_secs() >= AUTO_LOCK_SECONDS {
+            self.perform_logout();
+            self.login_error_msg = "Vault locked due to inactivity".into();
+        }
+
+        // Update activity timer on any input
+        if ctx.input(|i| i.pointer.any_click() || !i.keys_down.is_empty() || i.raw_scroll_delta.length() > 0.0) {
+            self.last_activity_time = Instant::now();
+        }
+
+        // Handle keyboard shortcuts (only when logged in and in main UI)
+        if self.is_logged_in && !self.show_vault_manager && !self.show_change_pw && !self.show_change_pattern {
+            ctx.input(|i| {
+                // Ctrl+L: Lock vault
+                if i.modifiers.ctrl && i.key_pressed(egui::Key::L) {
+                    self.perform_logout();
+                }
+                // Ctrl+G: Generate password
+                if i.modifiers.ctrl && i.key_pressed(egui::Key::G) {
+                    let user_symbols = self.collect_enabled_symbols();
+                    self.generated_password = generate_password(
+                        self.length,
+                        self.use_lowercase,
+                        self.use_uppercase,
+                        self.use_digits,
+                        &user_symbols,
+                    );
+                }
+            });
+        }
+
+        // Escape: Cancel current action
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                // Cancel editing
+                if self.editing_index.is_some() {
+                    self.editing_index = None;
+                    self.editing_website.zeroize();
+                    self.editing_username.zeroize();
+                    self.editing_password.zeroize();
+                }
+                // Cancel pending deletes
+                self.pending_delete_entry = None;
+                self.pending_delete_vault = None;
+                // Cancel change password/pattern
+                if self.show_change_pw {
+                    self.show_change_pw = false;
+                    self.new_master_pw_old_input.zeroize();
+                    self.new_master_pw.zeroize();
+                }
+                if self.show_change_pattern {
+                    self.show_change_pattern = false;
+                    self.old_password_for_pattern.zeroize();
+                    self.new_pattern_attempt.clear();
+                    self.new_pattern_unlocked = false;
+                }
+            }
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Show clipboard countdown if active
+            if let Some(copy_time) = self.clipboard_copy_time {
+                let remaining = CLIPBOARD_CLEAR_SECONDS.saturating_sub(copy_time.elapsed().as_secs());
+                if let Some(ref copy_type) = self.clipboard_copy_type {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        format!("{} copied - clipboard clears in {}s", copy_type, remaining),
+                    );
+                }
+            }
+
             if !self.login_error_msg.is_empty() {
                 ui.colored_label(Color32::RED, &self.login_error_msg);
             }
@@ -214,6 +345,77 @@ impl App for QuickPassApp {
 // Internal UI Implementation
 // ----------------------------------------------------------
 impl QuickPassApp {
+    /// Clears all sensitive state - call when switching vaults or logging out
+    fn clear_sensitive_state(&mut self) {
+        self.editing_index = None;
+        self.editing_website.zeroize();
+        self.editing_username.zeroize();
+        self.editing_password.zeroize();
+
+        self.generated_password.zeroize();
+        self.new_website.zeroize();
+        self.new_username.zeroize();
+        self.master_password_input.zeroize();
+        self.old_password_for_pattern.zeroize();
+        self.new_master_pw_old_input.zeroize();
+        self.new_master_pw.zeroize();
+        self.pattern_attempt.clear();
+        self.is_pattern_unlock = false;
+        self.new_pattern_attempt.clear();
+        self.new_pattern_unlocked = false;
+        self.first_run_password.zeroize();
+        self.first_run_pattern.clear();
+        self.first_run_pattern_unlocked = false;
+        self.search_query.clear();
+        self.new_tags_str.clear();
+        self.tag_filter.clear();
+        self.custom_tags.clear();
+        self.new_custom_tag.clear();
+        self.show_tag_manager = false;
+        self.show_export_dialog = false;
+        self.export_result = None;
+        self.show_import_dialog = false;
+        self.import_data.clear();
+        self.import_error = None;
+    }
+
+    /// Copy text to clipboard with auto-clear timer
+    fn copy_to_clipboard(&mut self, ctx: &egui::Context, text: &str, content_type: &str) {
+        ctx.copy_text(text.to_string());
+        self.clipboard_copy_time = Some(Instant::now());
+        self.clipboard_copy_type = Some(content_type.to_string());
+    }
+
+    /// Perform logout - save vault and clear sensitive state
+    fn perform_logout(&mut self) {
+        // Save before logout
+        if let Some(ref vault_key) = self.current_vault_key {
+            if let Some(mh) = &self.master_hash {
+                if let Err(e) = save_vault_file(
+                    &self.active_vault_name.clone().unwrap_or_default(),
+                    mh,
+                    self.pattern_hash.as_deref(),
+                    vault_key,
+                    &self.vault,
+                ) {
+                    eprintln!("Failed to save on logout: {e}");
+                }
+            }
+        }
+
+        self.clear_sensitive_state();
+        self.show_vault_manager = true;
+        self.active_vault_name = None;
+        self.is_logged_in = false;
+        self.vault.clear();
+        self.password_visible.clear();
+        self.show_change_pw = false;
+        self.show_change_pattern = false;
+        self.current_vault_key = None;
+        self.failed_attempts = 0;
+        self.last_activity_time = Instant::now();
+    }
+
     // (A) Vault Manager UI
     fn show_vault_manager_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(
@@ -224,6 +426,26 @@ impl QuickPassApp {
         ui.label("Manage multiple vaults below.");
 
         ui.separator();
+
+        // Handle pending vault deletion confirmation
+        if let Some(ref vault_to_delete) = self.pending_delete_vault.clone() {
+            ui.group(|ui| {
+                ui.colored_label(Color32::RED, format!("Delete vault '{}'?", vault_to_delete));
+                ui.label("This action cannot be undone!");
+                ui.horizontal(|ui| {
+                    if ui.button("Yes, Delete").clicked() {
+                        let path = vault_file_path(&vault_to_delete);
+                        let _ = std::fs::remove_file(path);
+                        self.manager_vaults = scan_vaults_in_dir();
+                        self.pending_delete_vault = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_delete_vault = None;
+                    }
+                });
+            });
+            ui.separator();
+        }
 
         if !self.manager_vaults.is_empty() {
             ui.label("Existing vaults:");
@@ -243,21 +465,7 @@ impl QuickPassApp {
                     ui.label(format!("(Last Accessed: {maybe_timestamp})"));
 
                     if ui.button("Open").clicked() {
-                        // Zeroize text fields first
-                        self.generated_password.zeroize();
-                        self.new_website.zeroize();
-                        self.new_username.zeroize();
-                        self.master_password_input.zeroize();
-                        self.old_password_for_pattern.zeroize();
-                        self.new_master_pw_old_input.zeroize();
-                        self.new_master_pw.zeroize();
-                        self.pattern_attempt.clear();
-                        self.is_pattern_unlock = false;
-                        self.new_pattern_attempt.clear();
-                        self.new_pattern_unlocked = false;
-                        self.first_run_password.zeroize();
-                        self.first_run_pattern.clear();
-                        self.first_run_pattern_unlocked = false;
+                        self.clear_sensitive_state();
                         self.failed_attempts = 0;
                         self.login_error_msg.clear();
 
@@ -269,10 +477,7 @@ impl QuickPassApp {
                         self.is_logged_in = false;
                     }
                     if ui.button("Delete").clicked() {
-                        let path = vault_file_path(&vault_name);
-                        let _ = std::fs::remove_file(path);
-                        // Re-scan
-                        self.manager_vaults = scan_vaults_in_dir();
+                        self.pending_delete_vault = Some(vault_name.clone());
                     }
                 });
             }
@@ -332,25 +537,45 @@ impl QuickPassApp {
         ui.label("You must set BOTH a master password AND a pattern.");
 
         ui.separator();
-        ui.label("Master Password:");
+        ui.label("Master Password (min 8 chars, uppercase, lowercase, digit):");
         ui.add(egui::TextEdit::singleline(&mut self.first_run_password).password(true));
 
+        // Show password strength feedback
+        if !self.first_run_password.is_empty() {
+            match validate_master_password(&self.first_run_password) {
+                Ok(()) => {
+                    ui.colored_label(Color32::GREEN, "Password meets requirements");
+                }
+                Err(errors) => {
+                    for err in errors {
+                        ui.colored_label(Color32::RED, format!("- {}", err));
+                    }
+                }
+            }
+        }
+
         ui.separator();
-        ui.label("Create a Pattern (6×6 grid, need >=8 clicks):");
+        ui.label("Create a Pattern (6x6 grid, need >=8 unique clicks):");
         self.show_pattern_lock_first_run(ui);
 
         if self.first_run_pattern_unlocked {
-            ui.colored_label(Color32::GREEN, "Pattern set!");
+            ui.colored_label(Color32::GREEN, format!("Pattern set! ({} cells)", self.first_run_pattern.len()));
         } else {
-            ui.colored_label(Color32::RED, "Pattern not set (need >=8).");
+            ui.colored_label(Color32::RED, format!("Pattern not set (need >=8 unique, have {}).", self.first_run_pattern.len()));
+        }
+
+        if ui.button("Reset Pattern").clicked() {
+            self.first_run_pattern.clear();
+            self.first_run_pattern_unlocked = false;
         }
 
         ui.separator();
         if ui.button("Create Vault").clicked() {
-            if self.first_run_password.is_empty() {
-                self.login_error_msg = "Please type a master password!".into();
+            // Validate master password
+            if let Err(errors) = validate_master_password(&self.first_run_password) {
+                self.login_error_msg = format!("Password: {}", errors.join(", "));
             } else if !self.first_run_pattern_unlocked {
-                self.login_error_msg = "Please create a pattern (8+ clicks)!".into();
+                self.login_error_msg = "Please create a pattern (8+ unique clicks)!".into();
             } else {
                 let pattern_hash = pattern_to_string(&self.first_run_pattern);
                 match create_new_vault_file(
@@ -393,6 +618,17 @@ impl QuickPassApp {
                 }
             }
         }
+
+        if ui.button("Return to Vault Manager").clicked() {
+            self.clear_sensitive_state();
+            self.login_error_msg.clear();
+            self.failed_attempts = 0;
+            self.show_vault_manager = true;
+            self.active_vault_name = None;
+            self.is_logged_in = false;
+            self.vault.clear();
+            self.password_visible.clear();
+        }
     }
 
     // (C) Login UI
@@ -415,6 +651,7 @@ impl QuickPassApp {
                         self.master_hash = Some(mh);
                         self.pattern_hash = ph;
                         self.vault = vault_data.entries;
+                        self.custom_tags = vault_data.metadata.custom_tags;
                         self.password_visible = vec![false; self.vault.len()];
                         self.is_logged_in = true;
                         self.login_error_msg.clear();
@@ -438,7 +675,7 @@ impl QuickPassApp {
 
         ui.separator();
         ui.label(
-            RichText::new("Or unlock with your Pattern (6×6 grid, >=8 clicks)")
+            RichText::new("Or unlock with your Pattern (6x6 grid, >=8 clicks)")
                 .size(20.0)
                 .color(Color32::GRAY),
         );
@@ -459,6 +696,7 @@ impl QuickPassApp {
                             self.master_hash = Some(mh);
                             self.pattern_hash = ph;
                             self.vault = vault_data.entries;
+                            self.custom_tags = vault_data.metadata.custom_tags;
                             self.password_visible = vec![false; self.vault.len()];
                             self.is_logged_in = true;
                             self.login_error_msg.clear();
@@ -486,7 +724,7 @@ impl QuickPassApp {
                 }
             }
         } else {
-            ui.colored_label(Color32::RED, "Pattern locked");
+            ui.colored_label(Color32::RED, format!("Pattern: {}/8 cells", self.pattern_attempt.len()));
         }
 
         if ui.button("Reset Pattern").clicked() {
@@ -496,26 +734,7 @@ impl QuickPassApp {
 
         ui.separator();
         if ui.button("Return to Vault Manager").clicked() {
-            // Dismiss editing
-            self.editing_index = None;
-            self.editing_website.zeroize();
-            self.editing_username.zeroize();
-            self.editing_password.zeroize();
-            // Zeroize text fields
-            self.generated_password.zeroize();
-            self.new_website.zeroize();
-            self.new_username.zeroize();
-            self.master_password_input.zeroize();
-            self.old_password_for_pattern.zeroize();
-            self.new_master_pw_old_input.zeroize();
-            self.new_master_pw.zeroize();
-            self.pattern_attempt.clear();
-            self.is_pattern_unlock = false;
-            self.new_pattern_attempt.clear();
-            self.new_pattern_unlocked = false;
-            self.first_run_password.zeroize();
-            self.first_run_pattern.clear();
-            self.first_run_pattern_unlocked = false;
+            self.clear_sensitive_state();
             self.login_error_msg.clear();
             self.failed_attempts = 0;
 
@@ -536,6 +755,47 @@ impl QuickPassApp {
             .auto_shrink([false; 2])
             .max_width(750.0)
             .show(ui, |ui| {
+                // Handle pending entry deletion confirmation
+                if let Some(idx) = self.pending_delete_entry {
+                    ui.group(|ui| {
+                        ui.colored_label(Color32::RED, format!("Delete entry #{}?", idx + 1));
+                        if idx < self.vault.len() {
+                            ui.label(format!("Website: {}", self.vault[idx].website));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes, Delete").clicked() {
+                                if idx < self.vault.len() {
+                                    let ent = &mut self.vault[idx];
+                                    ent.website.zeroize();
+                                    ent.username.zeroize();
+                                    ent.password.zeroize();
+
+                                    self.vault.remove(idx);
+                                    self.password_visible.remove(idx);
+
+                                    if let Some(ref vault_key) = self.current_vault_key {
+                                        if let Some(mh) = &self.master_hash {
+                                            let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                            let _ = save_vault_file(
+                                                &vault_name,
+                                                mh,
+                                                self.pattern_hash.as_deref(),
+                                                vault_key,
+                                                &self.vault,
+                                            );
+                                        }
+                                    }
+                                }
+                                self.pending_delete_entry = None;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.pending_delete_entry = None;
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
+
                 // (1) Center the vault name, smaller text:
                 ui.vertical_centered(|ui| {
                     ui.heading(
@@ -593,32 +853,90 @@ impl QuickPassApp {
                     ui.label("Website:");
                     ui.text_edit_singleline(&mut self.new_website);
                     ui.label("Tag:");
+                    // Build list of all tags (default + custom)
+                    let default_tags = vec!["Social", "Work", "School", "Personal", "Extra"];
                     egui::ComboBox::from_label("")
                         .selected_text(&self.new_tags_str)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.new_tags_str,
-                                "Social".to_string(),
-                                "Social",
-                            );
-                            ui.selectable_value(&mut self.new_tags_str, "Work".to_string(), "Work");
-                            ui.selectable_value(
-                                &mut self.new_tags_str,
-                                "School".to_string(),
-                                "School",
-                            );
-                            ui.selectable_value(
-                                &mut self.new_tags_str,
-                                "Personal".to_string(),
-                                "Personal",
-                            );
-                            ui.selectable_value(
-                                &mut self.new_tags_str,
-                                "Extra".to_string(),
-                                "Extra",
-                            );
+                            // Default tags
+                            for tag in &default_tags {
+                                ui.selectable_value(
+                                    &mut self.new_tags_str,
+                                    tag.to_string(),
+                                    *tag,
+                                );
+                            }
+                            // Custom tags
+                            for tag in &self.custom_tags.clone() {
+                                ui.selectable_value(
+                                    &mut self.new_tags_str,
+                                    tag.clone(),
+                                    format!("* {}", tag),
+                                );
+                            }
                         });
+                    if ui.button("Manage Tags").clicked() {
+                        self.show_tag_manager = !self.show_tag_manager;
+                    }
                 });
+
+                // Tag manager UI (collapsible)
+                if self.show_tag_manager {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Custom Tags Manager").color(Color32::YELLOW));
+                        ui.horizontal(|ui| {
+                            ui.label("New tag:");
+                            ui.text_edit_singleline(&mut self.new_custom_tag);
+                            if ui.button("Add Tag").clicked() {
+                                let tag_name = self.new_custom_tag.trim().to_string();
+                                if !tag_name.is_empty() && !self.custom_tags.contains(&tag_name) {
+                                    self.custom_tags.push(tag_name);
+                                    self.new_custom_tag.clear();
+                                    // Save custom tags to vault
+                                    if let Some(ref vault_key) = self.current_vault_key {
+                                        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                        let _ = update_custom_tags(
+                                            &vault_name,
+                                            vault_key,
+                                            &self.vault,
+                                            &self.custom_tags,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+
+                        if !self.custom_tags.is_empty() {
+                            ui.label("Your custom tags:");
+                            let tags_to_show = self.custom_tags.clone();
+                            let mut tag_to_remove: Option<usize> = None;
+                            for (idx, tag) in tags_to_show.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("  * {}", tag));
+                                    if ui.small_button("×").clicked() {
+                                        tag_to_remove = Some(idx);
+                                    }
+                                });
+                            }
+                            if let Some(idx) = tag_to_remove {
+                                self.custom_tags.remove(idx);
+                                // Save custom tags to vault
+                                if let Some(ref vault_key) = self.current_vault_key {
+                                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                    let _ = update_custom_tags(
+                                        &vault_name,
+                                        vault_key,
+                                        &self.vault,
+                                        &self.custom_tags,
+                                    );
+                                }
+                            }
+                        } else {
+                            ui.colored_label(Color32::GRAY, "No custom tags yet");
+                        }
+                    });
+                }
+
                 ui.horizontal(|ui| {
                     ui.label("Username:");
                     ui.text_edit_singleline(&mut self.new_username);
@@ -630,7 +948,7 @@ impl QuickPassApp {
                     // Visible text field so the user can see the password
                     ui.text_edit_singleline(&mut self.generated_password);
 
-                    if ui.button("↻ Generate").clicked() {
+                    if ui.button("Generate (Ctrl+G)").clicked() {
                         let user_symbols = self.collect_enabled_symbols();
                         self.generated_password = generate_password(
                             self.length,
@@ -737,7 +1055,7 @@ impl QuickPassApp {
                 ui.add_space(5.0);
 
                 ui.separator();
-                // (4) "Vault Entries" with tag filter on same line
+                // (4) "Vault Entries" with tag filter and search on same line
                 ui.vertical_centered(|ui| {
                     if let Some(name) = &self.active_vault_name {
                         ui.heading(
@@ -749,9 +1067,12 @@ impl QuickPassApp {
                 });
 
                 ui.horizontal(|ui| {
-                    
+                    ui.label("Search:");
+                    ui.text_edit_singleline(&mut self.search_query);
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         ui.add_space(10.0);
+                        let default_tags = vec!["Social", "Work", "School", "Personal", "Extra"];
                         egui::ComboBox::from_label("Tag Filter")
                             .selected_text(if self.tag_filter.is_empty() {
                                 "All".to_string()
@@ -760,55 +1081,52 @@ impl QuickPassApp {
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.tag_filter, "".to_string(), "All");
-                                ui.selectable_value(
-                                    &mut self.tag_filter,
-                                    "Social".to_string(),
-                                    "Social",
-                                );
-                                ui.selectable_value(
-                                    &mut self.tag_filter,
-                                    "Work".to_string(),
-                                    "Work",
-                                );
-                                ui.selectable_value(
-                                    &mut self.tag_filter,
-                                    "School".to_string(),
-                                    "School",
-                                );
-                                ui.selectable_value(
-                                    &mut self.tag_filter,
-                                    "Personal".to_string(),
-                                    "Personal",
-                                );
-                                ui.selectable_value(
-                                    &mut self.tag_filter,
-                                    "Extra".to_string(),
-                                    "Extra",
-                                );
+                                // Default tags
+                                for tag in &default_tags {
+                                    ui.selectable_value(
+                                        &mut self.tag_filter,
+                                        tag.to_string(),
+                                        *tag,
+                                    );
+                                }
+                                // Custom tags
+                                for tag in &self.custom_tags.clone() {
+                                    ui.selectable_value(
+                                        &mut self.tag_filter,
+                                        tag.clone(),
+                                        format!("* {}", tag),
+                                    );
+                                }
                             });
                     });
                 });
 
                 ui.separator();
 
-                // Build the list of relevant indices
+                // Build the list of relevant indices (filter by tag and search)
+                let search_lower = self.search_query.to_lowercase();
                 let mut relevant_indices = Vec::new();
                 for (idx, entry) in self.vault.iter().enumerate() {
-                    if self.tag_filter.is_empty() {
-                        relevant_indices.push(idx);
+                    // Check tag filter
+                    let tag_match = if self.tag_filter.is_empty() {
+                        true
                     } else {
-                        // if any tag matches ignoring ASCII case
-                        if entry
-                            .tags
-                            .iter()
-                            .any(|t| t.eq_ignore_ascii_case(&self.tag_filter))
-                        {
-                            relevant_indices.push(idx);
-                        }
+                        entry.tags.iter().any(|t| t.eq_ignore_ascii_case(&self.tag_filter))
+                    };
+
+                    // Check search query
+                    let search_match = if self.search_query.is_empty() {
+                        true
+                    } else {
+                        entry.website.to_lowercase().contains(&search_lower)
+                            || entry.username.to_lowercase().contains(&search_lower)
+                    };
+
+                    if tag_match && search_match {
+                        relevant_indices.push(idx);
                     }
                 }
 
-                let mut delete_index: Option<usize> = None;
                 let user_symbols = self.collect_enabled_symbols();
 
                 // Now show the vault entries
@@ -821,12 +1139,11 @@ impl QuickPassApp {
                             ui.group(|ui| {
                                 ui.set_width(750.0);
                                 ui.label(format!("Entry #{}", i + 1));
-                                let entry = &mut self.vault[i];
 
-                                // Show tags only
+                                // Show tags only - access by index to avoid borrow issues
+                                let tag_list = self.vault[i].tags.join(", ");
                                 ui.horizontal(|ui| {
                                     ui.label("Tags:");
-                                    let tag_list = entry.tags.join(", ");
                                     ui.label(tag_list);
                                 });
 
@@ -858,138 +1175,139 @@ impl QuickPassApp {
                                         );
                                     });
 
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Save").clicked() {
-                                            entry.website = self.editing_website.clone();
-                                            entry.username = self.editing_username.clone();
-                                            entry.password = self.editing_password.clone();
-                                            self.editing_index = None;
+                                    // Track button clicks
+                                    let save_clicked = ui.button("Save").clicked();
+                                    let cancel_clicked = ui.button("Cancel").clicked();
+
+                                    if save_clicked {
+                                        self.vault[i].website = self.editing_website.clone();
+                                        self.vault[i].username = self.editing_username.clone();
+                                        self.vault[i].password = self.editing_password.clone();
+
+                                        // FIXED: Save changes to disk
+                                        if let Some(ref vault_key) = self.current_vault_key {
+                                            if let Some(mh) = &self.master_hash {
+                                                let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                let _ = save_vault_file(
+                                                    &vault_name,
+                                                    mh,
+                                                    self.pattern_hash.as_deref(),
+                                                    vault_key,
+                                                    &self.vault,
+                                                );
+                                            }
                                         }
-                                        if ui.button("Cancel").clicked() {
-                                            self.editing_index = None;
-                                        }
-                                    });
+
+                                        self.editing_index = None;
+                                        self.editing_website.zeroize();
+                                        self.editing_username.zeroize();
+                                        self.editing_password.zeroize();
+                                    }
+                                    if cancel_clicked {
+                                        self.editing_index = None;
+                                        self.editing_website.zeroize();
+                                        self.editing_username.zeroize();
+                                        self.editing_password.zeroize();
+                                    }
                                 } else {
-                                    // Normal display UI
+                                    // Normal display UI - copy values to avoid borrow issues
+                                    let website = self.vault[i].website.clone();
+                                    let username = self.vault[i].username.clone();
+                                    let password = self.vault[i].password.clone();
+                                    let visible = self.password_visible[i];
+
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("Website: {}", entry.website));
-                                        // Right-justify copy
+                                        ui.label(format!("Website: {}", website));
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if ui.button("Copy").clicked() {
-                                                    ui.ctx().copy_text(entry.website.clone());
+                                                    self.copy_to_clipboard(ui.ctx(), &website, "Website");
                                                 }
                                             },
                                         );
                                     });
 
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("Username: {}", entry.username));
-                                        // Right-justify copy
+                                        ui.label(format!("Username: {}", username));
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if ui.button("Copy").clicked() {
-                                                    ui.ctx().copy_text(entry.username.clone());
+                                                    self.copy_to_clipboard(ui.ctx(), &username, "Username");
                                                 }
                                             },
                                         );
                                     });
 
                                     ui.horizontal(|ui| {
-                                        let visible = self.password_visible[i];
-                                        let display_str =
-                                            if visible { &entry.password } else { "***" };
+                                        let display_str = if visible { &password } else { "***" };
                                         ui.label(format!("Password: {}", display_str));
 
-                                        // Right-justify eye, then copy
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if ui.button("Copy").clicked() {
-                                                    ui.ctx().copy_text(entry.password.clone());
+                                                    self.copy_to_clipboard(ui.ctx(), &password, "Password");
                                                 }
-                                                let eye_label =
-                                                    if visible { "🙈" } else { "👁" };
+                                                let eye_label = if visible { "Hide" } else { "Show" };
                                                 if ui
                                                     .button(eye_label)
                                                     .on_hover_text("Toggle visibility")
                                                     .clicked()
                                                 {
-                                                    self.password_visible[i] =
-                                                        !self.password_visible[i];
+                                                    self.password_visible[i] = !self.password_visible[i];
                                                 }
                                             },
                                         );
                                     });
 
-                                    // Buttons: Edit, Regenerate, Delete
-                                    ui.horizontal(|ui| {
-                                        if ui.button("Edit").clicked() {
-                                            self.editing_index = Some(i);
-                                            self.editing_website = entry.website.clone();
-                                            self.editing_username = entry.username.clone();
-                                            self.editing_password = entry.password.clone();
-                                        }
+                                    // Track button clicks outside closures
+                                    let edit_clicked = ui.button("Edit").clicked();
+                                    let regenerate_clicked = ui.button("Regenerate").on_hover_text("Regenerate Password").clicked();
+                                    let delete_clicked = ui.button("Delete").on_hover_text("Remove this entry").clicked();
 
-                                        if ui
-                                            .button("↻")
-                                            .on_hover_text("Regenerate Password")
-                                            .clicked()
-                                        {
-                                            let old_len = entry.password.len();
-                                            let new_pwd = generate_password(
-                                                old_len,
-                                                self.use_lowercase,
-                                                self.use_uppercase,
-                                                self.use_digits,
-                                                &user_symbols,
-                                            );
-                                            entry.password = new_pwd;
-                                        }
+                                    if edit_clicked {
+                                        self.editing_index = Some(i);
+                                        self.editing_website = self.vault[i].website.clone();
+                                        self.editing_username = self.vault[i].username.clone();
+                                        self.editing_password = self.vault[i].password.clone();
+                                    }
 
-                                        if ui
-                                            .button("Delete")
-                                            .on_hover_text("Remove this entry")
-                                            .clicked()
-                                        {
-                                            delete_index = Some(i);
+                                    if regenerate_clicked {
+                                        let old_len = self.vault[i].password.len();
+                                        let new_pwd = generate_password(
+                                            old_len,
+                                            self.use_lowercase,
+                                            self.use_uppercase,
+                                            self.use_digits,
+                                            &user_symbols,
+                                        );
+                                        self.vault[i].password = new_pwd;
+
+                                        // Save after regeneration
+                                        if let Some(ref vault_key) = self.current_vault_key {
+                                            if let Some(mh) = &self.master_hash {
+                                                let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                let _ = save_vault_file(
+                                                    &vault_name,
+                                                    mh,
+                                                    self.pattern_hash.as_deref(),
+                                                    vault_key,
+                                                    &self.vault,
+                                                );
+                                            }
                                         }
-                                    });
+                                    }
+
+                                    if delete_clicked {
+                                        self.pending_delete_entry = Some(i);
+                                    }
                                 }
                             });
                             ui.separator();
-
-                            if delete_index.is_some() {
-                                break;
-                            }
                         }
                     });
-
-                // If an entry was marked for deletion, remove it now
-                if let Some(idx) = delete_index {
-                    let ent = &mut self.vault[idx];
-                    ent.website.zeroize();
-                    ent.username.zeroize();
-                    ent.password.zeroize();
-
-                    self.vault.remove(idx);
-                    self.password_visible.remove(idx);
-
-                    if let Some(ref vault_key) = self.current_vault_key {
-                        if let Some(mh) = &self.master_hash {
-                            let vault_name = self.active_vault_name.clone().unwrap_or_default();
-                            let _ = save_vault_file(
-                                &vault_name,
-                                mh,
-                                self.pattern_hash.as_deref(),
-                                vault_key,
-                                &self.vault,
-                            );
-                        }
-                    }
-                }
 
                 ui.horizontal(|ui| {
                     if ui.button("Change Master Password").clicked() {
@@ -1004,53 +1322,147 @@ impl QuickPassApp {
                         self.new_pattern_unlocked = false;
                     }
 
-                    if ui.button("Logout").clicked() {
-                        if let Some(ref vault_key) = self.current_vault_key {
-                            if let Some(mh) = &self.master_hash {
-                                if let Err(e) = save_vault_file(
-                                    &self.active_vault_name.clone().unwrap_or_default(),
-                                    mh,
-                                    self.pattern_hash.as_deref(),
-                                    vault_key,
-                                    &self.vault,
-                                ) {
-                                    eprintln!("Failed to save on logout: {e}");
-                                }
-                            }
-                        }
-                        // zero everything
-                        self.editing_index = None;
-                        self.editing_website.zeroize();
-                        self.editing_username.zeroize();
-                        self.editing_password.zeroize();
-
-                        self.generated_password.zeroize();
-                        self.new_website.zeroize();
-                        self.new_username.zeroize();
-                        self.master_password_input.zeroize();
-                        self.old_password_for_pattern.zeroize();
-                        self.new_master_pw_old_input.zeroize();
-                        self.new_master_pw.zeroize();
-                        self.pattern_attempt.clear();
-                        self.is_pattern_unlock = false;
-                        self.new_pattern_attempt.clear();
-                        self.new_pattern_unlocked = false;
-                        self.first_run_password.zeroize();
-                        self.first_run_pattern.clear();
-                        self.first_run_pattern_unlocked = false;
-
-                        self.show_vault_manager = true;
-                        self.active_vault_name = None;
-                        self.is_logged_in = false;
-                        self.vault.clear();
-                        self.password_visible.clear();
-                        self.show_change_pw = false;
-                        self.show_change_pattern = false;
-                        self.current_vault_key = None;
-                        self.failed_attempts = 0;
-                        self.login_error_msg.clear();
+                    if ui.button("Logout (Ctrl+L)").clicked() {
+                        self.perform_logout();
                     }
                 });
+
+                // Export/Import buttons
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Export Backup").clicked() {
+                        self.show_export_dialog = true;
+                        self.export_result = None;
+                    }
+                    if ui.button("Import Backup").clicked() {
+                        self.show_import_dialog = true;
+                        self.import_data.clear();
+                        self.import_error = None;
+                    }
+                });
+
+                // Export dialog
+                if self.show_export_dialog {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Export Vault").color(Color32::YELLOW).size(18.0));
+
+                        if let Some(result) = self.export_result.clone() {
+                            ui.label("Export successful! Copy the data below:");
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    ui.add(egui::TextEdit::multiline(&mut result.clone()).desired_width(f32::INFINITY));
+                                });
+                            if ui.button("Copy to Clipboard").clicked() {
+                                self.copy_to_clipboard(ui.ctx(), &result, "Backup");
+                            }
+                        } else {
+                            ui.colored_label(Color32::RED, "WARNING: CSV export contains passwords in plain text!");
+                            ui.horizontal(|ui| {
+                                if ui.button("Export Encrypted (Recommended)").clicked() {
+                                    if let Some(ref vault_key) = self.current_vault_key {
+                                        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                        match export_encrypted_backup(&vault_name, vault_key, &self.vault, &self.custom_tags) {
+                                            Ok(backup) => {
+                                                self.export_result = Some(backup);
+                                            }
+                                            Err(e) => {
+                                                self.login_error_msg = format!("Export failed: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                                if ui.button("Export CSV (Unencrypted)").clicked() {
+                                    let csv = export_to_csv(&self.vault);
+                                    self.export_result = Some(csv);
+                                }
+                            });
+                        }
+
+                        if ui.button("Close").clicked() {
+                            self.show_export_dialog = false;
+                            self.export_result = None;
+                        }
+                    });
+                }
+
+                // Import dialog
+                if self.show_import_dialog {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Import Backup").color(Color32::YELLOW).size(18.0));
+                        ui.label("Paste encrypted backup data below:");
+
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                ui.add(egui::TextEdit::multiline(&mut self.import_data).desired_width(f32::INFINITY));
+                            });
+
+                        if let Some(ref err) = self.import_error {
+                            ui.colored_label(Color32::RED, err);
+                        }
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Import (Merge)").clicked() {
+                                if let Some(ref vault_key) = self.current_vault_key {
+                                    match import_encrypted_backup(&self.import_data, vault_key) {
+                                        Ok(imported_data) => {
+                                            // Merge entries (avoid duplicates by website+username)
+                                            let mut added = 0;
+                                            for entry in imported_data.entries {
+                                                let exists = self.vault.iter().any(|e| {
+                                                    e.website == entry.website && e.username == entry.username
+                                                });
+                                                if !exists {
+                                                    self.vault.push(entry);
+                                                    self.password_visible.push(false);
+                                                    added += 1;
+                                                }
+                                            }
+                                            // Merge custom tags
+                                            for tag in imported_data.metadata.custom_tags {
+                                                if !self.custom_tags.contains(&tag) {
+                                                    self.custom_tags.push(tag);
+                                                }
+                                            }
+                                            // Save
+                                            if let Some(mh) = &self.master_hash {
+                                                let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                let _ = save_vault_file(
+                                                    &vault_name,
+                                                    mh,
+                                                    self.pattern_hash.as_deref(),
+                                                    vault_key,
+                                                    &self.vault,
+                                                );
+                                                let _ = update_custom_tags(
+                                                    &vault_name,
+                                                    vault_key,
+                                                    &self.vault,
+                                                    &self.custom_tags,
+                                                );
+                                            }
+                                            self.login_error_msg = format!("Imported {} new entries", added);
+                                            self.show_import_dialog = false;
+                                            self.import_data.clear();
+                                            self.import_error = None;
+                                        }
+                                        Err(e) => {
+                                            self.import_error = Some(format!("Import failed: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_import_dialog = false;
+                                self.import_data.clear();
+                                self.import_error = None;
+                            }
+                        });
+
+                        ui.colored_label(Color32::GRAY, "Note: Import merges entries. Duplicates (same website+username) are skipped.");
+                    });
+                }
             });
     }
 
@@ -1067,10 +1479,30 @@ impl QuickPassApp {
         ui.label("Old Password:");
         ui.add(egui::TextEdit::singleline(&mut self.new_master_pw_old_input).password(true));
 
-        ui.label("New Password:");
+        ui.label("New Password (min 8 chars, uppercase, lowercase, digit):");
         ui.add(egui::TextEdit::singleline(&mut self.new_master_pw).password(true));
 
+        // Show new password strength feedback
+        if !self.new_master_pw.is_empty() {
+            match validate_master_password(&self.new_master_pw) {
+                Ok(()) => {
+                    ui.colored_label(Color32::GREEN, "New password meets requirements");
+                }
+                Err(errors) => {
+                    for err in errors {
+                        ui.colored_label(Color32::RED, format!("- {}", err));
+                    }
+                }
+            }
+        }
+
         if ui.button("Confirm").clicked() {
+            // Validate new password first
+            if let Err(errors) = validate_master_password(&self.new_master_pw) {
+                self.login_error_msg = format!("New password: {}", errors.join(", "));
+                return;
+            }
+
             let vault_name = self.active_vault_name.clone().unwrap_or_default();
             if let Some(ref vault_key) = self.current_vault_key {
                 let old_pass = self.new_master_pw_old_input.clone();
@@ -1122,7 +1554,7 @@ impl QuickPassApp {
         ui.add(egui::TextEdit::singleline(&mut self.old_password_for_pattern).password(true));
 
         ui.separator();
-        ui.label("Create a new pattern (need >=8 clicks).");
+        ui.label("Create a new pattern (need >=8 unique clicks).");
         if self.new_pattern_attempt.len() >= 8 {
             self.new_pattern_unlocked = true;
         }
@@ -1141,9 +1573,12 @@ impl QuickPassApp {
                         Color32::DARK_BLUE
                     };
                     let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        self.new_pattern_attempt.push((row, col));
+                        // FIXED: Only add if not already clicked (unique cells only)
+                        if !self.new_pattern_attempt.contains(&(row, col)) {
+                            self.new_pattern_attempt.push((row, col));
+                        }
                     }
                 }
             });
@@ -1152,9 +1587,14 @@ impl QuickPassApp {
         *ui.spacing_mut() = original_spacing;
 
         if self.new_pattern_unlocked {
-            ui.colored_label(Color32::GREEN, "New pattern set!");
+            ui.colored_label(Color32::GREEN, format!("New pattern set! ({} cells)", self.new_pattern_attempt.len()));
         } else {
-            ui.colored_label(Color32::RED, "Not enough clicks yet (need >=8).");
+            ui.colored_label(Color32::RED, format!("Need >=8 unique cells (have {}).", self.new_pattern_attempt.len()));
+        }
+
+        if ui.button("Reset Pattern").clicked() {
+            self.new_pattern_attempt.clear();
+            self.new_pattern_unlocked = false;
         }
 
         if ui.button("Confirm Pattern").clicked() {
@@ -1219,9 +1659,12 @@ impl QuickPassApp {
                         Color32::DARK_BLUE
                     };
                     let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        self.first_run_pattern.push((row, col));
+                        // FIXED: Only add if not already clicked (unique cells only)
+                        if !self.first_run_pattern.contains(&(row, col)) {
+                            self.first_run_pattern.push((row, col));
+                        }
                     }
                 }
             });
@@ -1248,9 +1691,12 @@ impl QuickPassApp {
                         Color32::DARK_BLUE
                     };
                     let btn =
-                        egui::Button::new(RichText::new("●").size(30.0).color(clr)).frame(false);
+                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
                     if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        self.pattern_attempt.push((row, col));
+                        // FIXED: Only add if not already clicked (unique cells only)
+                        if !self.pattern_attempt.contains(&(row, col)) {
+                            self.pattern_attempt.push((row, col));
+                        }
                     }
                 }
             });
@@ -1261,8 +1707,9 @@ impl QuickPassApp {
 
     fn handle_login_failure(&mut self, err_msg: String) {
         self.failed_attempts += 1;
-        let attempts_left = 3 - self.failed_attempts;
-        if self.failed_attempts >= 3 {
+        let max_attempts = 5; // Increased from 3 to 5
+        let attempts_left = max_attempts - self.failed_attempts;
+        if self.failed_attempts >= max_attempts {
             let vault_name = self.active_vault_name.clone().unwrap_or_default();
             let path = vault_file_path(&vault_name);
             if path.exists() {
@@ -1279,6 +1726,7 @@ impl QuickPassApp {
             self.is_pattern_unlock = false;
             self.failed_attempts = 0;
             self.login_error_msg = "Vault was deleted after too many failed attempts!".into();
+            self.manager_vaults = scan_vaults_in_dir();
         } else {
             self.login_error_msg =
                 format!("{err_msg} - Wrong credentials! {attempts_left} attempts left.");
@@ -1299,12 +1747,12 @@ impl Drop for QuickPassApp {
         self.generated_password.zeroize();
         self.new_tags_str.zeroize();
         self.tag_filter.zeroize();
+        self.search_query.zeroize();
 
         for entry in &mut self.vault {
             entry.website.zeroize();
             entry.username.zeroize();
             entry.password.zeroize();
-            // tags themselves are non-sensitive, but we could also zero them if desired
         }
         self.vault.clear();
 
