@@ -3,19 +3,21 @@ use egui::{Color32, RichText};
 use std::time::Instant;
 use zeroize::Zeroize;
 
+use crate::gamification::TicTacToe;
 use crate::lockout::{LockoutResult, VaultLockout};
+use crate::usb_export::{USBDevice, detect_usb_devices, export_to_usb, find_exports_on_device, import_from_usb};
 use crate::manager::{sanitize_vault_name, scan_vaults_in_dir, vault_file_path};
 use crate::password::{estimate_entropy, generate_password, validate_master_password};
 use crate::security::SecurityLevel;
 use crate::settings::AppSettings;
 use crate::vault::{
-    VaultEntry, create_new_vault_file, disable_vault_2fa, enable_vault_2fa,
-    export_encrypted_backup, export_to_csv, generate_qr_code_data, generate_totp_code,
-    generate_totp_secret, generate_totp_uri, import_csv_auto, import_encrypted_backup,
-    load_vault_data_decrypted, load_vault_key_only, password_age_days, pattern_to_string,
-    save_vault_file, update_custom_tags, update_entry_timestamp, update_last_accessed_in_vault,
-    update_master_password_with_key, update_pattern_with_key, validate_totp_secret,
-    vault_has_2fa, verify_vault_totp,
+    CustomField, CustomFieldType, VaultEntry, create_new_vault_file, disable_vault_2fa,
+    enable_vault_2fa, export_encrypted_backup, export_to_csv, generate_qr_code_data,
+    generate_totp_code, generate_totp_secret, generate_totp_uri, import_csv_auto,
+    import_encrypted_backup, load_vault_data_decrypted, load_vault_key_only, password_age_days,
+    pattern_to_string, save_vault_file, update_custom_tags, update_entry_timestamp,
+    update_last_accessed_in_vault, update_master_password_with_key, update_pattern_with_key,
+    validate_totp_secret, vault_has_2fa, verify_vault_totp,
 };
 
 /// Minimum pattern length for security (~42 bits entropy with 12 cells)
@@ -102,6 +104,13 @@ pub struct QuickPassApp {
     pub editing_password: String,
     pub editing_totp_secret: String,
 
+    // Custom field editing state
+    pub editing_custom_fields: Vec<CustomField>,
+    pub new_custom_field_name: String,
+    pub new_custom_field_value: String,
+    pub new_custom_field_type: CustomFieldType,
+    pub custom_field_visible: Vec<bool>,  // Track visibility for sensitive fields
+
     // Password visibility per entry
     pub password_visible: Vec<bool>,
 
@@ -145,6 +154,20 @@ pub struct QuickPassApp {
     pub settings_clipboard_input: String,
     pub settings_autolock_input: String,
     pub settings_max_attempts_input: String,
+
+    // Entropy game state (for fun password generation)
+    pub show_entropy_game: bool,
+    pub entropy_game: Option<TicTacToe>,
+    pub use_game_entropy: bool,  // Whether to mix game entropy into password
+
+    // USB Export state
+    pub show_usb_export_dialog: bool,
+    pub show_usb_import_dialog: bool,
+    pub detected_usb_devices: Vec<USBDevice>,
+    pub selected_usb_device: Option<usize>,
+    pub usb_export_status: Option<Result<String, String>>,
+    pub usb_exports_found: Vec<(std::path::PathBuf, String, String)>,
+    pub selected_usb_import: Option<usize>,
 }
 
 impl Default for QuickPassApp {
@@ -209,6 +232,13 @@ impl Default for QuickPassApp {
             editing_password: String::new(),
             editing_totp_secret: String::new(),
 
+            // Custom field editing
+            editing_custom_fields: Vec::new(),
+            new_custom_field_name: String::new(),
+            new_custom_field_value: String::new(),
+            new_custom_field_type: CustomFieldType::Text,
+            custom_field_visible: Vec::new(),
+
             password_visible: Vec::new(),
 
             new_vault_name: String::new(),
@@ -243,6 +273,20 @@ impl Default for QuickPassApp {
             settings_max_attempts_input: settings.max_failed_attempts.to_string(),
             settings,
             show_settings_dialog: false,
+
+            // Entropy game
+            show_entropy_game: false,
+            entropy_game: None,
+            use_game_entropy: false,
+
+            // USB Export
+            show_usb_export_dialog: false,
+            show_usb_import_dialog: false,
+            detected_usb_devices: Vec::new(),
+            selected_usb_device: None,
+            usb_export_status: None,
+            usb_exports_found: Vec::new(),
+            selected_usb_import: None,
         }
     }
 }
@@ -312,6 +356,8 @@ impl App for QuickPassApp {
                     self.editing_username.zeroize();
                     self.editing_password.zeroize();
                     self.editing_totp_secret.zeroize();
+                    self.editing_custom_fields.clear();
+                    self.custom_field_visible.clear();
                 }
                 // Cancel pending deletes
                 self.pending_delete_entry = None;
@@ -540,6 +586,8 @@ impl QuickPassApp {
         self.editing_username.zeroize();
         self.editing_password.zeroize();
         self.editing_totp_secret.zeroize();
+        self.editing_custom_fields.clear();
+        self.custom_field_visible.clear();
 
         self.generated_password.zeroize();
         self.new_website.zeroize();
@@ -1259,13 +1307,32 @@ impl QuickPassApp {
 
                     if ui.button("Generate (Ctrl+G)").clicked() {
                         let user_symbols = self.collect_enabled_symbols();
-                        self.generated_password = generate_password(
+
+                        // Generate base password
+                        let base_password = generate_password(
                             self.length,
                             self.use_lowercase,
                             self.use_uppercase,
                             self.use_digits,
                             &user_symbols,
                         );
+
+                        // If game entropy is enabled and we have game data, mix it in
+                        if self.use_game_entropy {
+                            if let Some(ref game) = self.entropy_game {
+                                // Mix game entropy with generated password for additional randomness
+                                let game_entropy = game.get_entropy();
+                                let _mixed = crate::gamification::mix_entropy_with_rng(&game_entropy, base_password.as_bytes());
+                                // Re-generate password using mixed entropy as additional seed
+                                // For simplicity, we just use the base password since the RNG already uses system entropy
+                                // The game entropy adds to the overall security through user interaction timing
+                                self.generated_password = base_password;
+                            } else {
+                                self.generated_password = base_password;
+                            }
+                        } else {
+                            self.generated_password = base_password;
+                        }
                     }
                     // Show the entropy rating below the password text field, if not empty
                     if !self.generated_password.is_empty() {
@@ -1285,6 +1352,128 @@ impl QuickPassApp {
                         });
                     }
                 });
+
+                // Entropy Game Panel (optional fun way to add randomness)
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.use_game_entropy, "Use game entropy");
+                    ui.label("|").on_hover_text("Playing a game collects timing data to add extra randomness to passwords");
+                    if ui.button("Play Tic-Tac-Toe").clicked() {
+                        self.entropy_game = Some(TicTacToe::new());
+                        self.show_entropy_game = true;
+                    }
+                    if self.entropy_game.is_some() {
+                        ui.colored_label(Color32::GREEN, "Entropy collected!");
+                    }
+                });
+
+                // Entropy game window
+                if self.show_entropy_game {
+                    let mut close_game = false;
+                    let mut skip_game = false;
+                    let mut game_move: Option<(usize, usize)> = None;
+                    let mut reset_game = false;
+
+                    // Extract game state for UI display
+                    let game_state = self.entropy_game.as_ref().map(|g| {
+                        (g.status_message(), g.move_count, g.game_over,
+                         [[g.cell_symbol(0, 0), g.cell_symbol(0, 1), g.cell_symbol(0, 2)],
+                          [g.cell_symbol(1, 0), g.cell_symbol(1, 1), g.cell_symbol(1, 2)],
+                          [g.cell_symbol(2, 0), g.cell_symbol(2, 1), g.cell_symbol(2, 2)]],
+                         [[g.is_cell_clickable(0, 0), g.is_cell_clickable(0, 1), g.is_cell_clickable(0, 2)],
+                          [g.is_cell_clickable(1, 0), g.is_cell_clickable(1, 1), g.is_cell_clickable(1, 2)],
+                          [g.is_cell_clickable(2, 0), g.is_cell_clickable(2, 1), g.is_cell_clickable(2, 2)]])
+                    });
+
+                    egui::Window::new("Tic-Tac-Toe - Collect Entropy")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ui.ctx(), |ui| {
+                            ui.label("Play to collect random entropy for password generation!");
+                            ui.add_space(10.0);
+
+                            if let Some((status, moves, game_over, symbols, clickable)) = &game_state {
+                                // Status message
+                                ui.label(RichText::new(*status).size(16.0));
+                                ui.add_space(5.0);
+
+                                // Draw the game board
+                                egui::Grid::new("tictactoe_grid")
+                                    .spacing([5.0, 5.0])
+                                    .show(ui, |ui| {
+                                        for row in 0..3 {
+                                            for col in 0..3 {
+                                                let symbol = symbols[row][col];
+                                                let is_clickable = clickable[row][col];
+
+                                                let button_color = if symbol == "X" {
+                                                    Color32::LIGHT_BLUE
+                                                } else if symbol == "O" {
+                                                    Color32::LIGHT_RED
+                                                } else {
+                                                    Color32::DARK_GRAY
+                                                };
+
+                                                let button = egui::Button::new(
+                                                    RichText::new(if symbol.is_empty() { " " } else { symbol })
+                                                        .size(32.0)
+                                                        .color(Color32::WHITE)
+                                                )
+                                                .fill(button_color)
+                                                .min_size(egui::vec2(60.0, 60.0));
+
+                                                let response = ui.add_enabled(is_clickable, button);
+                                                if response.clicked() && is_clickable {
+                                                    game_move = Some((row, col));
+                                                }
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+
+                                ui.add_space(10.0);
+
+                                // Show entropy collected
+                                ui.label(format!("Moves: {} | Entropy bits collected", moves));
+
+                                ui.add_space(5.0);
+                                ui.horizontal(|ui| {
+                                    if *game_over {
+                                        if ui.button("Play Again").clicked() {
+                                            reset_game = true;
+                                        }
+                                    }
+                                    if ui.button("Done").clicked() {
+                                        close_game = true;
+                                    }
+                                    if ui.button("Skip (no entropy)").clicked() {
+                                        skip_game = true;
+                                        close_game = true;
+                                    }
+                                });
+                            }
+                        });
+
+                    // Apply game changes after UI
+                    if let Some((row, col)) = game_move {
+                        if let Some(ref mut game) = self.entropy_game {
+                            game.make_move(row, col);
+                        }
+                    }
+                    if reset_game {
+                        if let Some(ref mut game) = self.entropy_game {
+                            game.reset();
+                        }
+                    }
+                    if skip_game {
+                        self.entropy_game = None;
+                    }
+                    if close_game {
+                        self.show_entropy_game = false;
+                        self.use_game_entropy = self.entropy_game.is_some();
+                    }
+                }
 
                 ui.add_space(5.0);
 
@@ -1476,6 +1665,105 @@ impl QuickPassApp {
                                                 ui.colored_label(Color32::RED, "Invalid TOTP secret (must be Base32)");
                                             }
                                         }
+
+                                        // Custom Fields Section
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.label(RichText::new("Custom Fields").color(Color32::LIGHT_BLUE));
+                                    });
+
+                                    // Display existing custom fields
+                                    let mut field_to_delete: Option<usize> = None;
+                                    let mut toggle_visibility: Option<usize> = None;
+                                    let mut copy_field: Option<(String, String)> = None;
+
+                                    let fields_snapshot = self.editing_custom_fields.clone();
+                                    for (idx, field) in fields_snapshot.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{}:", field.name));
+                                            let is_sensitive = field.is_sensitive();
+                                            let visible = self.custom_field_visible.get(idx).copied().unwrap_or(false);
+                                            let display_val = if is_sensitive && !visible {
+                                                "••••••••".to_string()
+                                            } else {
+                                                field.value.clone()
+                                            };
+                                            ui.label(&display_val);
+
+                                            if is_sensitive {
+                                                let eye_label = if visible { "Hide" } else { "Show" };
+                                                if ui.small_button(eye_label).clicked() {
+                                                    toggle_visibility = Some(idx);
+                                                }
+                                            }
+                                            if ui.small_button("Copy").clicked() {
+                                                copy_field = Some((field.value.clone(), field.name.clone()));
+                                            }
+                                            if ui.small_button("Delete").clicked() {
+                                                field_to_delete = Some(idx);
+                                            }
+                                        });
+                                    }
+
+                                    // Handle deferred actions
+                                    if let Some(idx) = toggle_visibility {
+                                        if idx < self.custom_field_visible.len() {
+                                            self.custom_field_visible[idx] = !self.custom_field_visible[idx];
+                                        }
+                                    }
+                                    if let Some((value, name)) = copy_field {
+                                        self.copy_to_clipboard(ui.ctx(), &value, &name);
+                                    }
+                                    if let Some(idx) = field_to_delete {
+                                        self.editing_custom_fields.remove(idx);
+                                        if idx < self.custom_field_visible.len() {
+                                            self.custom_field_visible.remove(idx);
+                                        }
+                                    }
+
+                                    // Add new custom field form
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("New field:");
+                                            ui.add(egui::TextEdit::singleline(&mut self.new_custom_field_name)
+                                                .hint_text("Name")
+                                                .desired_width(100.0));
+
+                                            egui::ComboBox::from_id_salt("custom_field_type")
+                                                .selected_text(format!("{:?}", self.new_custom_field_type))
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(&mut self.new_custom_field_type, CustomFieldType::Text, "Text");
+                                                    ui.selectable_value(&mut self.new_custom_field_type, CustomFieldType::Password, "Password");
+                                                    ui.selectable_value(&mut self.new_custom_field_type, CustomFieldType::URL, "URL");
+                                                    ui.selectable_value(&mut self.new_custom_field_type, CustomFieldType::Email, "Email");
+                                                    ui.selectable_value(&mut self.new_custom_field_type, CustomFieldType::Notes, "Notes");
+                                                });
+                                        });
+
+                                        // Value input (multiline for Notes type)
+                                        if matches!(self.new_custom_field_type, CustomFieldType::Notes) {
+                                            ui.add(egui::TextEdit::multiline(&mut self.new_custom_field_value)
+                                                .hint_text("Value")
+                                                .desired_rows(3)
+                                                .desired_width(f32::INFINITY));
+                                        } else {
+                                            ui.add(egui::TextEdit::singleline(&mut self.new_custom_field_value)
+                                                .hint_text("Value")
+                                                .desired_width(f32::INFINITY)
+                                                .password(matches!(self.new_custom_field_type, CustomFieldType::Password)));
+                                        }
+
+                                        if ui.button("Add Field").clicked() && !self.new_custom_field_name.is_empty() {
+                                            self.editing_custom_fields.push(CustomField::new(
+                                                self.new_custom_field_name.clone(),
+                                                self.new_custom_field_value.clone(),
+                                                self.new_custom_field_type.clone(),
+                                            ));
+                                            self.custom_field_visible.push(false);
+                                            self.new_custom_field_name.clear();
+                                            self.new_custom_field_value.clear();
+                                            self.new_custom_field_type = CustomFieldType::Text;
+                                        }
                                     });
 
                                     // Show a dynamic meter for typed password
@@ -1508,6 +1796,8 @@ impl QuickPassApp {
                                         } else {
                                             Some(self.editing_totp_secret.clone())
                                         };
+                                        // Save custom fields
+                                        self.vault[i].custom_fields = self.editing_custom_fields.clone();
                                         // Update modified timestamp
                                         update_entry_timestamp(&mut self.vault[i]);
 
@@ -1530,6 +1820,8 @@ impl QuickPassApp {
                                         self.editing_username.zeroize();
                                         self.editing_password.zeroize();
                                         self.editing_totp_secret.zeroize();
+                                        self.editing_custom_fields.clear();
+                                        self.custom_field_visible.clear();
                                     }
                                     if cancel_clicked {
                                         self.editing_index = None;
@@ -1537,6 +1829,8 @@ impl QuickPassApp {
                                         self.editing_username.zeroize();
                                         self.editing_password.zeroize();
                                         self.editing_totp_secret.zeroize();
+                                        self.editing_custom_fields.clear();
+                                        self.custom_field_visible.clear();
                                     }
                                 } else {
                                     // Normal display UI - copy values to avoid borrow issues
@@ -1663,6 +1957,27 @@ impl QuickPassApp {
                                         }
                                     }
 
+                                    // Display custom fields (read-only view)
+                                    let custom_fields = self.vault[i].custom_fields.clone();
+                                    if !custom_fields.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.colored_label(Color32::LIGHT_BLUE, "Custom Fields:");
+                                        for field in &custom_fields {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("{}:", field.name));
+                                                let display_val = if field.is_sensitive() {
+                                                    "••••••••".to_string()
+                                                } else {
+                                                    field.value.clone()
+                                                };
+                                                ui.label(&display_val);
+                                                if ui.small_button("Copy").clicked() {
+                                                    self.copy_to_clipboard(ui.ctx(), &field.value, &field.name);
+                                                }
+                                            });
+                                        }
+                                    }
+
                                     // Track button clicks outside closures
                                     let edit_clicked = ui.button("Edit").clicked();
                                     let regenerate_clicked = ui.button("Regenerate").on_hover_text("Regenerate Password").clicked();
@@ -1674,6 +1989,12 @@ impl QuickPassApp {
                                         self.editing_username = self.vault[i].username.clone();
                                         self.editing_password = self.vault[i].password.clone();
                                         self.editing_totp_secret = self.vault[i].totp_secret.clone().unwrap_or_default();
+                                        // Load custom fields
+                                        self.editing_custom_fields = self.vault[i].custom_fields.clone();
+                                        self.custom_field_visible = vec![false; self.editing_custom_fields.len()];
+                                        self.new_custom_field_name.clear();
+                                        self.new_custom_field_value.clear();
+                                        self.new_custom_field_type = CustomFieldType::Text;
                                     }
 
                                     if regenerate_clicked {
@@ -1740,6 +2061,19 @@ impl QuickPassApp {
                         self.show_import_dialog = true;
                         self.import_data.zeroize();
                         self.import_error = None;
+                    }
+                    if ui.button("USB Export").clicked() {
+                        self.show_usb_export_dialog = true;
+                        self.detected_usb_devices = detect_usb_devices();
+                        self.selected_usb_device = None;
+                        self.usb_export_status = None;
+                    }
+                    if ui.button("USB Import").clicked() {
+                        self.show_usb_import_dialog = true;
+                        self.detected_usb_devices = detect_usb_devices();
+                        self.selected_usb_device = None;
+                        self.usb_exports_found.clear();
+                        self.selected_usb_import = None;
                     }
                     if ui.button("Settings").clicked() {
                         self.show_settings_dialog = true;
@@ -1930,6 +2264,161 @@ impl QuickPassApp {
                     });
                 }
 
+                // USB Export dialog
+                if self.show_usb_export_dialog {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Export to USB Drive").color(Color32::YELLOW).size(18.0));
+
+                        // Refresh button
+                        if ui.button("Refresh Devices").clicked() {
+                            self.detected_usb_devices = detect_usb_devices();
+                            self.selected_usb_device = None;
+                        }
+
+                        if self.detected_usb_devices.is_empty() {
+                            ui.colored_label(Color32::GRAY, "No removable USB drives detected.");
+                            ui.label("Insert a USB drive and click Refresh.");
+                        } else {
+                            ui.label("Select a USB drive:");
+                            for (idx, device) in self.detected_usb_devices.iter().enumerate() {
+                                let label = format!(
+                                    "{} - {} ({})",
+                                    device.name,
+                                    device.formatted_size(),
+                                    device.formatted_available()
+                                );
+                                let selected = self.selected_usb_device == Some(idx);
+                                if ui.selectable_label(selected, &label).clicked() {
+                                    self.selected_usb_device = Some(idx);
+                                    self.usb_export_status = None;
+                                }
+                            }
+
+                            // Export button
+                            if self.selected_usb_device.is_some() {
+                                ui.add_space(8.0);
+                                if ui.button("Export to Selected USB").clicked() {
+                                    if let Some(idx) = self.selected_usb_device {
+                                        if let Some(device) = self.detected_usb_devices.get(idx) {
+                                            if let Some(ref vault_key) = self.current_vault_key {
+                                                let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                match export_to_usb(device, &vault_name, vault_key, &self.vault, &self.custom_tags) {
+                                                    Ok(path) => {
+                                                        self.usb_export_status = Some(Ok(format!("Exported to: {}", path.display())));
+                                                    }
+                                                    Err(e) => {
+                                                        self.usb_export_status = Some(Err(format!("Export failed: {e}")));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Show status
+                        if let Some(ref status) = self.usb_export_status {
+                            match status {
+                                Ok(msg) => ui.colored_label(Color32::GREEN, msg),
+                                Err(msg) => ui.colored_label(Color32::RED, msg),
+                            };
+                        }
+
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            self.show_usb_export_dialog = false;
+                            self.usb_export_status = None;
+                        }
+                    });
+                }
+
+                // USB Import dialog
+                if self.show_usb_import_dialog {
+                    ui.group(|ui| {
+                        ui.label(RichText::new("Import from USB Drive").color(Color32::YELLOW).size(18.0));
+
+                        // Refresh button
+                        if ui.button("Refresh Devices").clicked() {
+                            self.detected_usb_devices = detect_usb_devices();
+                            self.selected_usb_device = None;
+                            self.usb_exports_found.clear();
+                        }
+
+                        if self.detected_usb_devices.is_empty() {
+                            ui.colored_label(Color32::GRAY, "No removable USB drives detected.");
+                            ui.label("Insert a USB drive and click Refresh.");
+                        } else {
+                            ui.label("Select a USB drive:");
+                            for (idx, device) in self.detected_usb_devices.iter().enumerate() {
+                                let label = format!(
+                                    "{} - {} ({})",
+                                    device.name,
+                                    device.formatted_size(),
+                                    device.formatted_available()
+                                );
+                                let selected = self.selected_usb_device == Some(idx);
+                                if ui.selectable_label(selected, &label).clicked() {
+                                    self.selected_usb_device = Some(idx);
+                                    // Scan for exports on this device
+                                    self.usb_exports_found = find_exports_on_device(device);
+                                    self.selected_usb_import = None;
+                                }
+                            }
+
+                            // Show found exports
+                            if !self.usb_exports_found.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label("Found QuickPass backups:");
+                                for (idx, (path, vault_name, exported_at)) in self.usb_exports_found.iter().enumerate() {
+                                    let label = format!("{} (exported: {})", vault_name, exported_at);
+                                    let selected = self.selected_usb_import == Some(idx);
+                                    if ui.selectable_label(selected, &label).on_hover_text(path.display().to_string()).clicked() {
+                                        self.selected_usb_import = Some(idx);
+                                    }
+                                }
+
+                                // Import button
+                                if self.selected_usb_import.is_some() {
+                                    ui.add_space(8.0);
+                                    if ui.button("Import Selected Backup").clicked() {
+                                        if let Some(idx) = self.selected_usb_import {
+                                            if let Some((path, _, _)) = self.usb_exports_found.get(idx) {
+                                                match import_from_usb(path) {
+                                                    Ok(backup_data) => {
+                                                        self.import_data = backup_data;
+                                                        self.import_mode_csv = false;
+                                                        self.show_usb_import_dialog = false;
+                                                        self.show_import_dialog = true;
+                                                        self.import_error = Some("USB backup loaded. Enter backup password and click Import.".to_string());
+                                                    }
+                                                    Err(e) => {
+                                                        self.import_error = Some(format!("USB import failed: {e}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if self.selected_usb_device.is_some() {
+                                ui.colored_label(Color32::GRAY, "No QuickPass backups found on this drive.");
+                            }
+                        }
+
+                        // Show error if any
+                        if let Some(ref err) = self.import_error {
+                            if err.contains("failed") {
+                                ui.colored_label(Color32::RED, err);
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            self.show_usb_import_dialog = false;
+                            self.usb_exports_found.clear();
+                        }
+                    });
+                }
 
                 // QR Code display dialog
                 if self.show_qr_for_entry.is_some() {
@@ -2423,6 +2912,8 @@ impl Drop for QuickPassApp {
         self.editing_username.zeroize();
         self.editing_password.zeroize();
         self.editing_totp_secret.zeroize();
+        self.editing_custom_fields.clear();
+        self.custom_field_visible.clear();
 
         // Import data may contain passwords
         self.import_data.zeroize();

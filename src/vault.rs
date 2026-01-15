@@ -21,6 +21,36 @@ use crate::security::{SecurityLevel, argon2_for_level, generate_random_salt};
 /// Result type for vault key loading: (master_hash, pattern_hash, vault_key)
 pub type VaultKeyResult = Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>>;
 
+/// Custom field types for vault entries
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+pub enum CustomFieldType {
+    #[default]
+    Text,
+    Password,   // Masked in UI
+    URL,
+    Email,
+    Notes,      // Multiline
+}
+
+/// A custom key-value field for a vault entry
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CustomField {
+    pub name: String,
+    pub value: String,
+    pub field_type: CustomFieldType,
+}
+
+impl CustomField {
+    pub fn new(name: String, value: String, field_type: CustomFieldType) -> Self {
+        Self { name, value, field_type }
+    }
+
+    /// Returns true if this field type should be masked in the UI
+    pub fn is_sensitive(&self) -> bool {
+        matches!(self.field_type, CustomFieldType::Password)
+    }
+}
+
 /// Each vault entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VaultEntry {
@@ -37,6 +67,9 @@ pub struct VaultEntry {
     /// TOTP secret (Base32 encoded) for 2FA
     #[serde(default)]
     pub totp_secret: Option<String>,
+    /// Custom user-defined fields (notes, security questions, etc.)
+    #[serde(default)]
+    pub custom_fields: Vec<CustomField>,
 }
 
 /// Metadata stored (encrypted) along with the vault entries
@@ -639,6 +672,7 @@ pub fn create_entry_with_timestamp(
         created_at: Some(now.clone()),
         modified_at: Some(now),
         totp_secret: None,
+        custom_fields: Vec::new(),
     }
 }
 
@@ -1348,6 +1382,7 @@ mod tests {
                     created_at: Some("2026-01-14 12:00:00 UTC".to_string()),
                     modified_at: Some("2026-01-14 12:00:00 UTC".to_string()),
                     totp_secret: None,
+                    custom_fields: Vec::new(),
                 },
             ],
             metadata: VaultMetadata {
@@ -1378,6 +1413,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     totp_secret: None,
+                    custom_fields: Vec::new(),
                 },
                 VaultEntry {
                     website: "email.com".to_string(),
@@ -1387,6 +1423,7 @@ mod tests {
                     created_at: None,
                     modified_at: None,
                     totp_secret: None,
+                    custom_fields: Vec::new(),
                 },
             ],
             metadata: VaultMetadata {
@@ -1548,6 +1585,7 @@ bank.com,user2,pass2,Finance"#;
             created_at: None,
             modified_at: Some("2026-01-14 12:00:00 UTC".to_string()),
             totp_secret: None,
+            custom_fields: Vec::new(),
         };
 
         let age = password_age_days(&entry);

@@ -47,16 +47,38 @@ A secure, cross-platform desktop password manager built in Rust with eframe/egui
 
 ### Pre-built Binaries
 
-Download from the [Releases](https://github.com/yourusername/QuickPass/releases) page:
-- `QuickPass-Windows.exe` - Windows executable
-- `QuickPass-Linux` - Linux binary
-- `QuickPass-macOS` - macOS binary
+Download the latest release for your platform from [GitHub Releases](https://github.com/Technical-1/QuickPass/releases):
+
+| Platform | File | Notes |
+|----------|------|-------|
+| Windows | `QuickPass-Windows.exe` | Double-click to run |
+| Linux | `QuickPass-Linux` | Run `chmod +x QuickPass-Linux` first |
+| macOS | `QuickPass-macOS` | See macOS notes below |
+
+#### macOS First Run
+
+macOS may block unsigned applications. To run QuickPass:
+
+1. **Right-click** the binary and select **"Open"**, OR
+2. Go to **System Preferences > Security & Privacy > General** and click **"Allow Anyway"**
+
+#### Linux Dependencies
+
+On some Linux distributions, you may need GTK libraries:
+
+```bash
+# Ubuntu/Debian
+sudo apt install libgtk-3-0
+
+# Fedora
+sudo dnf install gtk3
+```
 
 ### Build from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/QuickPass.git
+git clone https://github.com/Technical-1/QuickPass.git
 cd QuickPass
 
 # Build release version
@@ -124,10 +146,71 @@ Files:
 ```bash
 cargo build              # Development build
 cargo build --release    # Release build
-cargo test               # Run all tests (101 tests)
+cargo test               # Run all tests (100+ tests)
 cargo run                # Run the application
 cargo clippy             # Run linter
 ```
+
+### Testing
+
+QuickPass has comprehensive test coverage:
+
+```bash
+cargo test                          # Run all tests
+cargo test --lib                    # Library tests only
+cargo test --test integration_tests # Integration tests only
+cargo test -- --nocapture           # Show println! output
+cargo test password_tests::         # Run specific module tests
+```
+
+**Test Categories:**
+- **Unit Tests** (~70 tests): Password generation, entropy calculation, encryption/decryption, validation
+- **Integration Tests** (~30 tests): Full workflows, import/export, security features
+
+### Quality Checks
+
+Before submitting PRs, ensure:
+
+```bash
+cargo clippy -- -D warnings   # No linter warnings
+cargo test                    # All tests pass
+cargo build --release         # Release builds successfully
+```
+
+## CI/CD Pipeline
+
+QuickPass uses GitHub Actions for automated builds and releases.
+
+### Automated Release Workflow
+
+The CI/CD pipeline automatically:
+1. Builds binaries for Windows, Linux, and macOS
+2. Runs all tests
+3. Creates GitHub Releases with downloadable artifacts
+
+### Triggering a Release
+
+Push a semantic version tag to trigger a release:
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+### Build Matrix
+
+| Platform | Runner | Binary Size |
+|----------|--------|-------------|
+| Windows | `windows-latest` | ~8 MB |
+| Linux | `ubuntu-latest` | ~6 MB |
+| macOS | `macos-latest` | ~7 MB |
+
+### Workflow File
+
+The workflow is defined in `.github/workflows/build.yml` and includes:
+- Parallel builds across all platforms
+- Artifact upload to GitHub Actions
+- Automatic release creation with all binaries
 
 ### Project Structure
 
