@@ -87,57 +87,36 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: QuickPass-Windows
-          path: ./dist
+          path: ./dist/windows
 
       - name: Download Linux
         uses: actions/download-artifact@v4
         with:
           name: QuickPass-Linux
-          path: ./dist
+          path: ./dist/linux
 
       - name: Download macOS
         uses: actions/download-artifact@v4
         with:
           name: QuickPass-macOS
-          path: ./dist
+          path: ./dist/macos
 
-      - name: Create Release
-        id: create_release
-        uses: comnoco/create-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rename artifacts for release
+        run: |
+          mv ./dist/windows/QuickPass.exe ./dist/QuickPass-Windows.exe
+          mv ./dist/linux/QuickPass ./dist/QuickPass-Linux
+          mv ./dist/macos/QuickPass ./dist/QuickPass-macOS
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          release_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-
-      - name: Upload Windows
-        uses: actions/upload-release-asset@v1
+          files: |
+            ./dist/QuickPass-Windows.exe
+            ./dist/QuickPass-Linux
+            ./dist/QuickPass-macOS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/QuickPass.exe
-          asset_name: QuickPass-Windows.exe
-          asset_content_type: application/octet-stream
-
-      - name: Upload Linux
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/QuickPass
-          asset_name: QuickPass-Linux
-          asset_content_type: application/octet-stream
-
-      - name: Upload macOS
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/QuickPass
-          asset_name: QuickPass-macOS
-          asset_content_type: application/octet-stream
