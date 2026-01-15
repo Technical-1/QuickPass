@@ -1,7 +1,9 @@
 mod app;
+mod lockout;
 mod manager;
 mod password;
 mod security;
+mod settings;
 mod vault;
 use eframe::egui::{self};
 

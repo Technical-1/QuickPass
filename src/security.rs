@@ -10,14 +10,20 @@ pub enum SecurityLevel {
 }
 
 /// Produces an Argon2 object configured for the specified security level.
+///
+/// All levels meet or exceed OWASP Argon2id recommendations:
+/// - Minimum: 19 MiB memory, 2 iterations, 1 parallelism
+///
+/// Parameters chosen to balance security and usability on modern hardware.
 pub fn argon2_for_level(level: SecurityLevel) -> Argon2<'static> {
     let algorithm = Algorithm::Argon2id;
     let version = Version::V0x13;
     // Memory in KiB, number of iterations, parallelism
+    // OWASP minimum: 19 MiB, 2 iterations - all levels exceed this
     let (mem_kib, iters, par) = match level {
-        SecurityLevel::Low => (16 * 1024, 2, 2),    // ~16MB
-        SecurityLevel::Medium => (32 * 1024, 3, 4), // ~32MB
-        SecurityLevel::High => (64 * 1024, 4, 4),   // ~64MB
+        SecurityLevel::Low => (19 * 1024, 3, 2),    // ~19MB, 3 iterations - Fast unlock
+        SecurityLevel::Medium => (47 * 1024, 3, 4), // ~47MB, 3 iterations - Balanced
+        SecurityLevel::High => (64 * 1024, 4, 4),   // ~64MB, 4 iterations - Maximum security
     };
     let params = Params::new(mem_kib, iters, par, Some(32)).expect("Invalid Argon2 params");
     Argon2::new(algorithm, version, params)

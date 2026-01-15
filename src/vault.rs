@@ -25,6 +25,15 @@ pub struct VaultEntry {
     pub username: String,
     pub password: String,
     pub tags: Vec<String>,
+    /// When this entry was created (ISO 8601)
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// When this entry was last modified (ISO 8601)
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    /// TOTP secret (Base32 encoded) for 2FA
+    #[serde(default)]
+    pub totp_secret: Option<String>,
 }
 
 /// Metadata stored (encrypted) along with the vault entries
@@ -65,6 +74,13 @@ pub struct EncryptedVaultFile {
 
     // Plaintext field to avoid expensive decryption in Vault Manager
     pub last_accessed_plaintext: Option<String>,
+
+    /// Encrypted TOTP secret for vault-level 2FA (encrypted with vault key)
+    #[serde(default)]
+    pub totp_secret_encrypted: Option<Vec<u8>>,
+    /// Nonce for TOTP secret encryption
+    #[serde(default)]
+    pub totp_nonce: Option<Vec<u8>>,
 }
 
 // ----------------------------------------------------------------
@@ -88,11 +104,55 @@ fn encrypt_vault_bytes(
     Ok((nonce_arr.to_vec(), ciphertext))
 }
 
+/// Decrypt bytes with a given 256-bit vault_key.
+fn decrypt_vault_bytes(
+    ciphertext: &[u8],
+    nonce: &[u8],
+    vault_key: &[u8],
+) -> Result<Vec<u8>, Box<dyn StdError>> {
+    let cipher_key = Key::<Aes256Gcm>::from_slice(vault_key);
+    let cipher = Aes256Gcm::new(cipher_key);
+    let nonce = Nonce::from_slice(nonce);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+    Ok(plaintext)
+}
+
+/// AES-GCM nonce length (12 bytes)
+const AES_GCM_NONCE_LENGTH: usize = 12;
+/// AES-GCM authentication tag length (16 bytes)
+const AES_GCM_TAG_LENGTH: usize = 16;
+
+/// Validate encrypted data structure before decryption
+fn validate_encrypted_data(nonce: &[u8], ciphertext: &[u8]) -> Result<(), Box<dyn StdError>> {
+    if nonce.len() != AES_GCM_NONCE_LENGTH {
+        return Err(Box::new(IoError::new(
+            ErrorKind::InvalidData,
+            format!(
+                "Invalid nonce length: expected {}, got {} - vault file may be corrupted",
+                AES_GCM_NONCE_LENGTH,
+                nonce.len()
+            ),
+        )));
+    }
+    if ciphertext.len() < AES_GCM_TAG_LENGTH {
+        return Err(Box::new(IoError::new(
+            ErrorKind::InvalidData,
+            "Ciphertext too short - vault file may be corrupted",
+        )));
+    }
+    Ok(())
+}
+
 /// Decrypt with a given 256-bit key, returning the plaintext bytes.
 fn decrypt_vault_data(
     (nonce_bytes, ciphertext): (&[u8], &[u8]),
     vault_key: &[u8],
 ) -> Result<Vec<u8>, Box<dyn StdError>> {
+    // Validate nonce and ciphertext lengths before attempting decryption
+    validate_encrypted_data(nonce_bytes, ciphertext)?;
+
     let cipher_key = Key::<Aes256Gcm>::from_slice(vault_key);
     let cipher = Aes256Gcm::new(cipher_key);
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -150,6 +210,9 @@ fn decrypt_with_derived_key(
     salt: &SaltString,
     level: SecurityLevel,
 ) -> Result<Vec<u8>, Box<dyn StdError>> {
+    // Validate nonce and ciphertext lengths before attempting decryption
+    validate_encrypted_data(nonce_bytes, ciphertext)?;
+
     let key_bytes = derive_key_from_input(input, salt, level);
     let cipher_key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(cipher_key);
@@ -207,11 +270,13 @@ pub fn read_encrypted_vault_file(
 // ----------------------------------------------------------------
 
 /// Create a new vault file with a random vault key, storing it encrypted by both master password and pattern.
+/// If totp_secret is provided, it will be encrypted and stored for vault-level 2FA.
 pub fn create_new_vault_file(
     vault_name: &str,
     master_password: &str,
     pattern_hash_str: &str,
     level: SecurityLevel,
+    totp_secret: Option<&str>,
 ) -> Result<(String, String), Box<dyn StdError>> {
     let path = vault_file_path(vault_name);
     let argon2 = argon2_for_level(level);
@@ -250,6 +315,14 @@ pub fn create_new_vault_file(
     let vault_data_json = serde_json::to_vec(&vault_data)?;
     let (vault_nonce, vault_ciphertext) = encrypt_vault_bytes(&vault_data_json, &vault_key)?;
 
+    // Encrypt TOTP secret if provided
+    let (totp_secret_encrypted, totp_nonce) = if let Some(secret) = totp_secret {
+        let (nonce, ciphertext) = encrypt_vault_bytes(secret.as_bytes(), &vault_key)?;
+        (Some(ciphertext), Some(nonce))
+    } else {
+        (None, None)
+    };
+
     vault_key.zeroize();
 
     let ef = EncryptedVaultFile {
@@ -264,6 +337,8 @@ pub fn create_new_vault_file(
         vault_nonce,
         security_level: level,
         last_accessed_plaintext: None,
+        totp_secret_encrypted,
+        totp_nonce,
     };
 
     write_encrypted_vault_file(path, &ef)?;
@@ -285,6 +360,14 @@ pub fn load_vault_key_only(
         .map_err(|e| IoError::new(ErrorKind::InvalidData, format!("Invalid salt: {}", e)))?;
 
     if let Some(patt_bytes) = pattern {
+        // SECURITY: Reject empty patterns - defense in depth
+        if patt_bytes.is_empty() {
+            return Err(Box::new(IoError::new(
+                ErrorKind::InvalidInput,
+                "Pattern cannot be empty",
+            )));
+        }
+
         // Check if a pattern hash is stored
         let phash = ef
             .pattern_hash
@@ -309,13 +392,20 @@ pub fn load_vault_key_only(
         Ok((ef.master_hash, ef.pattern_hash, vault_key))
     } else {
         // text-based unlock with master password
-        if !master_password.is_empty() {
-            let parsed_hash = PasswordHash::new(&ef.master_hash)
-                .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
-            argon2
-                .verify_password(master_password.as_bytes(), &parsed_hash)
-                .map_err(|_| IoError::new(ErrorKind::InvalidData, "Master password mismatch"))?;
+        // SECURITY: Reject empty passwords - this is critical to prevent bypass
+        if master_password.is_empty() {
+            return Err(Box::new(IoError::new(
+                ErrorKind::InvalidInput,
+                "Master password cannot be empty",
+            )));
         }
+
+        let parsed_hash = PasswordHash::new(&ef.master_hash)
+            .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+        argon2
+            .verify_password(master_password.as_bytes(), &parsed_hash)
+            .map_err(|_| IoError::new(ErrorKind::InvalidData, "Master password mismatch"))?;
+
         let vault_key = decrypt_with_derived_key(
             &ef.encrypted_key_pw,
             &ef.nonce_pw,
@@ -530,6 +620,556 @@ fn escape_csv_field(field: &str) -> String {
     }
 }
 
+/// Create a new VaultEntry with current timestamp
+pub fn create_entry_with_timestamp(
+    website: String,
+    username: String,
+    password: String,
+    tags: Vec<String>,
+) -> VaultEntry {
+    let now = current_utc_timestamp_string();
+    VaultEntry {
+        website,
+        username,
+        password,
+        tags,
+        created_at: Some(now.clone()),
+        modified_at: Some(now),
+        totp_secret: None,
+    }
+}
+
+/// Create a new VaultEntry with TOTP secret
+pub fn create_entry_with_totp(
+    website: String,
+    username: String,
+    password: String,
+    tags: Vec<String>,
+    totp_secret: Option<String>,
+) -> VaultEntry {
+    let now = current_utc_timestamp_string();
+    VaultEntry {
+        website,
+        username,
+        password,
+        tags,
+        created_at: Some(now.clone()),
+        modified_at: Some(now),
+        totp_secret,
+    }
+}
+
+/// Update an entry's modified_at timestamp
+pub fn update_entry_timestamp(entry: &mut VaultEntry) {
+    entry.modified_at = Some(current_utc_timestamp_string());
+}
+
+/// Calculate password age in days from modified_at timestamp
+pub fn password_age_days(entry: &VaultEntry) -> Option<i64> {
+    let modified = entry.modified_at.as_ref().or(entry.created_at.as_ref())?;
+    // Parse the timestamp (format: "2026-01-14 12:00:00 UTC")
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(
+        modified.trim_end_matches(" UTC"),
+        "%Y-%m-%d %H:%M:%S",
+    ) {
+        let now = Utc::now().naive_utc();
+        Some((now - parsed).num_days())
+    } else {
+        None
+    }
+}
+
+// ----------------------------------------------------------------
+// TOTP Functions
+// ----------------------------------------------------------------
+
+use totp_rs::{Algorithm, TOTP, Secret};
+
+/// Generate a TOTP code from a Base32-encoded secret
+/// Returns the 6-digit code and seconds remaining until next code
+pub fn generate_totp_code(secret: &str) -> Result<(String, u64), Box<dyn StdError>> {
+    let secret_bytes = Secret::Encoded(secret.to_string())
+        .to_bytes()
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, format!("Invalid TOTP secret: {}", e)))?;
+
+    let totp = TOTP::new(
+        Algorithm::SHA1,
+        6,      // 6 digits
+        1,      // 1 step skew allowed
+        30,     // 30 second step
+        secret_bytes,
+    ).map_err(|e| IoError::new(ErrorKind::InvalidData, format!("Failed to create TOTP: {}", e)))?;
+
+    let code = totp.generate_current()
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, format!("Failed to generate TOTP: {}", e)))?;
+
+    // Calculate seconds remaining
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let seconds_remaining = 30 - (now % 30);
+
+    Ok((code, seconds_remaining))
+}
+
+/// Generate a new random TOTP secret (Base32 encoded)
+pub fn generate_totp_secret() -> String {
+    use totp_rs::Secret;
+    let secret = Secret::generate_secret();
+    secret.to_encoded().to_string()
+}
+
+/// Validate a TOTP secret format (must be valid Base32)
+pub fn validate_totp_secret(secret: &str) -> bool {
+    Secret::Encoded(secret.to_string()).to_bytes().is_ok()
+}
+
+/// Generate a TOTP URI for use in QR codes
+/// Format: otpauth://totp/Label?secret=SECRET&issuer=Issuer
+pub fn generate_totp_uri(secret: &str, account: &str, issuer: &str) -> String {
+    let label = if issuer.is_empty() {
+        account.to_string()
+    } else {
+        format!("{}:{}", issuer, account)
+    };
+
+    // URL encode the label and issuer
+    let encoded_label = label.replace(' ', "%20").replace(':', "%3A");
+    let encoded_issuer = issuer.replace(' ', "%20");
+
+    if issuer.is_empty() {
+        format!("otpauth://totp/{}?secret={}", encoded_label, secret)
+    } else {
+        format!(
+            "otpauth://totp/{}?secret={}&issuer={}",
+            encoded_label, secret, encoded_issuer
+        )
+    }
+}
+
+/// Generate QR code data as a 2D boolean grid
+/// Returns (width, data) where data[y * width + x] indicates a dark module
+pub fn generate_qr_code_data(content: &str) -> Result<(usize, Vec<bool>), Box<dyn StdError>> {
+    use qrcode::QrCode;
+
+    let code = QrCode::new(content.as_bytes())
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, format!("QR code generation failed: {}", e)))?;
+
+    let width = code.width();
+    let data: Vec<bool> = code
+        .into_colors()
+        .into_iter()
+        .map(|c| c == qrcode::Color::Dark)
+        .collect();
+
+    Ok((width, data))
+}
+
+// ----------------------------------------------------------------
+// Vault-level 2FA Functions
+// ----------------------------------------------------------------
+
+/// Check if a vault has 2FA enabled
+pub fn vault_has_2fa(vault_name: &str) -> bool {
+    if let Ok(ef) = read_encrypted_vault_file(vault_file_path(vault_name)) {
+        ef.totp_secret_encrypted.is_some()
+    } else {
+        false
+    }
+}
+
+/// Decrypt and verify a TOTP code for vault-level 2FA
+/// Returns Ok(true) if code matches, Ok(false) if code doesn't match
+pub fn verify_vault_totp(
+    vault_name: &str,
+    vault_key: &[u8],
+    totp_code: &str,
+) -> Result<bool, Box<dyn StdError>> {
+    let ef = read_encrypted_vault_file(vault_file_path(vault_name))?;
+
+    let encrypted = ef
+        .totp_secret_encrypted
+        .ok_or_else(|| IoError::new(ErrorKind::NotFound, "Vault does not have 2FA enabled"))?;
+    let nonce = ef
+        .totp_nonce
+        .ok_or_else(|| IoError::new(ErrorKind::NotFound, "Missing TOTP nonce"))?;
+
+    // Decrypt the TOTP secret
+    let secret_bytes = decrypt_vault_bytes(&encrypted, &nonce, vault_key)?;
+    let secret = String::from_utf8(secret_bytes)
+        .map_err(|e| IoError::new(ErrorKind::InvalidData, e.to_string()))?;
+
+    // Generate current TOTP code and compare
+    match generate_totp_code(&secret) {
+        Ok((expected_code, _)) => Ok(expected_code == totp_code),
+        Err(e) => Err(e),
+    }
+}
+
+/// Enable 2FA on an existing vault
+pub fn enable_vault_2fa(
+    vault_name: &str,
+    vault_key: &[u8],
+    totp_secret: &str,
+) -> Result<(), Box<dyn StdError>> {
+    let path = vault_file_path(vault_name);
+    let mut ef = read_encrypted_vault_file(&path)?;
+
+    // Encrypt the TOTP secret
+    let (nonce, ciphertext) = encrypt_vault_bytes(totp_secret.as_bytes(), vault_key)?;
+    ef.totp_secret_encrypted = Some(ciphertext);
+    ef.totp_nonce = Some(nonce);
+
+    write_encrypted_vault_file(path, &ef)
+}
+
+/// Disable 2FA on an existing vault
+pub fn disable_vault_2fa(vault_name: &str) -> Result<(), Box<dyn StdError>> {
+    let path = vault_file_path(vault_name);
+    let mut ef = read_encrypted_vault_file(&path)?;
+
+    ef.totp_secret_encrypted = None;
+    ef.totp_nonce = None;
+
+    write_encrypted_vault_file(path, &ef)
+}
+
+// ----------------------------------------------------------------
+// Import from Other Password Managers
+// ----------------------------------------------------------------
+
+/// Supported import formats
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImportFormat {
+    /// QuickPass native CSV (website,username,password,tags)
+    QuickPass,
+    /// Bitwarden CSV export
+    Bitwarden,
+    /// 1Password CSV export
+    OnePassword,
+    /// LastPass CSV export
+    LastPass,
+    /// Generic CSV (tries to auto-detect columns)
+    Generic,
+}
+
+/// Parse a CSV line, handling quoted fields
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes => {
+                // Check for escaped quote
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '"' if !in_quotes => {
+                in_quotes = true;
+            }
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+/// Import entries from Bitwarden CSV export
+/// Format: folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+pub fn import_bitwarden_csv(csv_data: &str) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+    let mut entries = Vec::new();
+    let lines: Vec<&str> = csv_data.lines().collect();
+
+    if lines.is_empty() {
+        return Ok(entries);
+    }
+
+    // Find column indices from header
+    let header = parse_csv_line(lines[0]);
+    let name_idx = header.iter().position(|h| h == "name");
+    let uri_idx = header.iter().position(|h| h == "login_uri");
+    let username_idx = header.iter().position(|h| h == "login_username");
+    let password_idx = header.iter().position(|h| h == "login_password");
+    let folder_idx = header.iter().position(|h| h == "folder");
+
+    for line in lines.iter().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields = parse_csv_line(line);
+
+        let website = uri_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .or_else(|| name_idx.and_then(|i| fields.get(i)).map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let username = username_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let password = password_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let tag = folder_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Imported".to_string());
+
+        if !website.is_empty() || !username.is_empty() {
+            entries.push(create_entry_with_timestamp(
+                website,
+                username,
+                password,
+                vec![tag],
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Import entries from 1Password CSV export
+/// Format: Title,Url,Username,Password,Notes,OTPAuth,Tags
+pub fn import_1password_csv(csv_data: &str) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+    let mut entries = Vec::new();
+    let lines: Vec<&str> = csv_data.lines().collect();
+
+    if lines.is_empty() {
+        return Ok(entries);
+    }
+
+    let header = parse_csv_line(lines[0]);
+    let title_idx = header.iter().position(|h| h.to_lowercase() == "title");
+    let url_idx = header.iter().position(|h| h.to_lowercase() == "url");
+    let username_idx = header.iter().position(|h| h.to_lowercase() == "username");
+    let password_idx = header.iter().position(|h| h.to_lowercase() == "password");
+    let tags_idx = header.iter().position(|h| h.to_lowercase() == "tags");
+
+    for line in lines.iter().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields = parse_csv_line(line);
+
+        let website = url_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .or_else(|| title_idx.and_then(|i| fields.get(i)).map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let username = username_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let password = password_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let tag = tags_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Imported".to_string());
+
+        if !website.is_empty() || !username.is_empty() {
+            entries.push(create_entry_with_timestamp(
+                website,
+                username,
+                password,
+                vec![tag],
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Import entries from LastPass CSV export
+/// Format: url,username,password,totp,extra,name,grouping,fav
+pub fn import_lastpass_csv(csv_data: &str) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+    let mut entries = Vec::new();
+    let lines: Vec<&str> = csv_data.lines().collect();
+
+    if lines.is_empty() {
+        return Ok(entries);
+    }
+
+    let header = parse_csv_line(lines[0]);
+    let url_idx = header.iter().position(|h| h.to_lowercase() == "url");
+    let username_idx = header.iter().position(|h| h.to_lowercase() == "username");
+    let password_idx = header.iter().position(|h| h.to_lowercase() == "password");
+    let name_idx = header.iter().position(|h| h.to_lowercase() == "name");
+    let grouping_idx = header.iter().position(|h| h.to_lowercase() == "grouping");
+
+    for line in lines.iter().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields = parse_csv_line(line);
+
+        let website = url_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .or_else(|| name_idx.and_then(|i| fields.get(i)).map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let username = username_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let password = password_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let tag = grouping_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Imported".to_string());
+
+        if !website.is_empty() || !username.is_empty() {
+            entries.push(create_entry_with_timestamp(
+                website,
+                username,
+                password,
+                vec![tag],
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Import entries from generic CSV (auto-detects columns)
+/// Looks for common column names: url/website, username/user/email, password/pass
+pub fn import_generic_csv(csv_data: &str) -> Result<Vec<VaultEntry>, Box<dyn StdError>> {
+    let mut entries = Vec::new();
+    let lines: Vec<&str> = csv_data.lines().collect();
+
+    if lines.is_empty() {
+        return Ok(entries);
+    }
+
+    let header = parse_csv_line(lines[0]);
+    let header_lower: Vec<String> = header.iter().map(|h| h.to_lowercase()).collect();
+
+    // Find website column
+    let website_idx = header_lower.iter().position(|h| {
+        h.contains("url") || h.contains("website") || h.contains("site") || h.contains("name")
+    });
+
+    // Find username column
+    let username_idx = header_lower.iter().position(|h| {
+        h.contains("username") || h.contains("user") || h.contains("email") || h.contains("login")
+    });
+
+    // Find password column
+    let password_idx = header_lower.iter().position(|h| {
+        h.contains("password") || h.contains("pass") || h.contains("secret")
+    });
+
+    // Find tag column
+    let tag_idx = header_lower.iter().position(|h| {
+        h.contains("tag") || h.contains("folder") || h.contains("group") || h.contains("category")
+    });
+
+    for line in lines.iter().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields = parse_csv_line(line);
+
+        let website = website_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let username = username_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let password = password_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let tag = tag_idx
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Imported".to_string());
+
+        if !website.is_empty() || !username.is_empty() {
+            entries.push(create_entry_with_timestamp(
+                website,
+                username,
+                password,
+                vec![tag],
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Auto-detect import format from CSV content
+pub fn detect_import_format(csv_data: &str) -> ImportFormat {
+    let first_line = csv_data.lines().next().unwrap_or("");
+    let header_lower = first_line.to_lowercase();
+
+    if header_lower.contains("login_uri") && header_lower.contains("login_username") {
+        ImportFormat::Bitwarden
+    } else if header_lower.contains("title") && header_lower.contains("otpauth") {
+        ImportFormat::OnePassword
+    } else if header_lower.contains("grouping") && header_lower.contains("fav") {
+        ImportFormat::LastPass
+    } else if header_lower.contains("website") && header_lower.contains("tags") {
+        ImportFormat::QuickPass
+    } else {
+        ImportFormat::Generic
+    }
+}
+
+/// Import entries using auto-detection
+pub fn import_csv_auto(csv_data: &str) -> Result<(Vec<VaultEntry>, ImportFormat), Box<dyn StdError>> {
+    let format = detect_import_format(csv_data);
+    let entries = match format {
+        ImportFormat::Bitwarden => import_bitwarden_csv(csv_data)?,
+        ImportFormat::OnePassword => import_1password_csv(csv_data)?,
+        ImportFormat::LastPass => import_lastpass_csv(csv_data)?,
+        ImportFormat::QuickPass | ImportFormat::Generic => import_generic_csv(csv_data)?,
+    };
+    Ok((entries, format))
+}
+
 /// Export vault to encrypted JSON format (can be imported later).
 pub fn export_encrypted_backup(
     vault_name: &str,
@@ -722,6 +1362,9 @@ mod tests {
                     username: "user@example.com".to_string(),
                     password: "s3cr3t!".to_string(),
                     tags: vec!["Work".to_string()],
+                    created_at: Some("2026-01-14 12:00:00 UTC".to_string()),
+                    modified_at: Some("2026-01-14 12:00:00 UTC".to_string()),
+                    totp_secret: None,
                 },
             ],
             metadata: VaultMetadata {
@@ -749,12 +1392,18 @@ mod tests {
                     username: "myuser".to_string(),
                     password: "BankP@ss123!".to_string(),
                     tags: vec!["Finance".to_string(), "Important".to_string()],
+                    created_at: None,
+                    modified_at: None,
+                    totp_secret: None,
                 },
                 VaultEntry {
                     website: "email.com".to_string(),
                     username: "email@test.com".to_string(),
                     password: "Em@ilS3cure!".to_string(),
                     tags: vec!["Personal".to_string()],
+                    created_at: None,
+                    modified_at: None,
+                    totp_secret: None,
                 },
             ],
             metadata: VaultMetadata {
@@ -774,5 +1423,227 @@ mod tests {
         assert_eq!(restored.entries.len(), 2);
         assert_eq!(restored.entries[0].website, "bank.com");
         assert_eq!(restored.entries[1].website, "email.com");
+    }
+
+    // ---- Nonce Validation Tests (Phase 2.5) ----
+
+    #[test]
+    fn test_validate_encrypted_data_valid() {
+        let valid_nonce = [0u8; 12];
+        let valid_ciphertext = [0u8; 32]; // 16 bytes tag + some data
+        assert!(validate_encrypted_data(&valid_nonce, &valid_ciphertext).is_ok());
+    }
+
+    #[test]
+    fn test_validate_encrypted_data_invalid_nonce_length() {
+        let short_nonce = [0u8; 8]; // Too short
+        let ciphertext = [0u8; 32];
+        assert!(validate_encrypted_data(&short_nonce, &ciphertext).is_err());
+
+        let long_nonce = [0u8; 16]; // Too long
+        assert!(validate_encrypted_data(&long_nonce, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn test_validate_encrypted_data_short_ciphertext() {
+        let valid_nonce = [0u8; 12];
+        let short_ciphertext = [0u8; 8]; // Less than 16 bytes tag
+        assert!(validate_encrypted_data(&valid_nonce, &short_ciphertext).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_with_invalid_nonce_fails_gracefully() {
+        let mut vault_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut vault_key);
+
+        // Encrypt some data first
+        let test_data = b"Test data";
+        let (nonce, ciphertext) = encrypt_vault_bytes(test_data, &vault_key).unwrap();
+
+        // Valid decryption should work
+        assert!(decrypt_vault_data((&nonce, &ciphertext), &vault_key).is_ok());
+
+        // Invalid nonce length should fail with error, not panic
+        let bad_nonce = [0u8; 8];
+        let result = decrypt_vault_data((&bad_nonce, &ciphertext), &vault_key);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nonce"));
+    }
+
+    // ---- CSV Parsing Tests (Phase 4.2) ----
+
+    #[test]
+    fn test_parse_csv_line_simple() {
+        let line = "field1,field2,field3";
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["field1", "field2", "field3"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_quoted() {
+        let line = r#""field,with,commas",field2,"field3""#;
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec!["field,with,commas", "field2", "field3"]);
+    }
+
+    #[test]
+    fn test_parse_csv_line_escaped_quotes() {
+        let line = r#""field with ""quotes""",field2"#;
+        let fields = parse_csv_line(line);
+        assert_eq!(fields, vec![r#"field with "quotes""#, "field2"]);
+    }
+
+    #[test]
+    fn test_import_bitwarden_csv() {
+        let csv = r#"folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+Work,0,login,Example,,,0,https://example.com,user@example.com,mypassword123,
+Personal,1,login,Bank,,,0,https://bank.com,bankuser,bankpass123,"#;
+
+        let entries = import_bitwarden_csv(csv).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].website, "https://example.com");
+        assert_eq!(entries[0].username, "user@example.com");
+        assert_eq!(entries[0].password, "mypassword123");
+        assert_eq!(entries[0].tags, vec!["Work"]);
+        assert_eq!(entries[1].website, "https://bank.com");
+        assert_eq!(entries[1].tags, vec!["Personal"]);
+    }
+
+    #[test]
+    fn test_import_lastpass_csv() {
+        let csv = r#"url,username,password,totp,extra,name,grouping,fav
+https://example.com,user@test.com,testpass123,,,Example Site,Social,0
+https://bank.com,bankuser,bankpass,,,Bank,Finance,1"#;
+
+        let entries = import_lastpass_csv(csv).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].website, "https://example.com");
+        assert_eq!(entries[0].username, "user@test.com");
+        assert_eq!(entries[0].password, "testpass123");
+        assert_eq!(entries[0].tags, vec!["Social"]);
+    }
+
+    #[test]
+    fn test_import_generic_csv() {
+        let csv = r#"website,username,password,category
+example.com,user1,pass1,Work
+bank.com,user2,pass2,Finance"#;
+
+        let entries = import_generic_csv(csv).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].website, "example.com");
+        assert_eq!(entries[0].username, "user1");
+        assert_eq!(entries[0].password, "pass1");
+        assert_eq!(entries[0].tags, vec!["Work"]);
+    }
+
+    #[test]
+    fn test_detect_import_format_bitwarden() {
+        let csv = "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\n";
+        assert_eq!(detect_import_format(csv), ImportFormat::Bitwarden);
+    }
+
+    #[test]
+    fn test_detect_import_format_lastpass() {
+        let csv = "url,username,password,totp,extra,name,grouping,fav\n";
+        assert_eq!(detect_import_format(csv), ImportFormat::LastPass);
+    }
+
+    #[test]
+    fn test_detect_import_format_generic() {
+        let csv = "url,user,pass\n";
+        assert_eq!(detect_import_format(csv), ImportFormat::Generic);
+    }
+
+    #[test]
+    fn test_password_age_calculation() {
+        let entry = VaultEntry {
+            website: "test.com".to_string(),
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            tags: vec![],
+            created_at: None,
+            modified_at: Some("2026-01-14 12:00:00 UTC".to_string()),
+            totp_secret: None,
+        };
+
+        let age = password_age_days(&entry);
+        assert!(age.is_some());
+        // Age should be non-negative (entry was created today or in the past)
+        assert!(age.unwrap() >= 0);
+    }
+
+    #[test]
+    fn test_create_entry_with_timestamp() {
+        let entry = create_entry_with_timestamp(
+            "example.com".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            vec!["Work".to_string()],
+        );
+
+        assert_eq!(entry.website, "example.com");
+        assert_eq!(entry.username, "user");
+        assert_eq!(entry.password, "pass");
+        assert!(entry.created_at.is_some());
+        assert!(entry.modified_at.is_some());
+        assert!(entry.totp_secret.is_none());
+    }
+
+    // ---- TOTP Tests (Phase 4.3) ----
+
+    #[test]
+    fn test_generate_totp_secret() {
+        let secret = generate_totp_secret();
+        // Generated secret should be non-empty and valid Base32
+        assert!(!secret.is_empty());
+        assert!(validate_totp_secret(&secret));
+    }
+
+    #[test]
+    fn test_validate_totp_secret_valid() {
+        // Standard test secret that meets 128-bit minimum
+        assert!(validate_totp_secret("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"));
+    }
+
+    #[test]
+    fn test_validate_totp_secret_invalid() {
+        // Invalid Base32 characters
+        assert!(!validate_totp_secret("invalid!@#"));
+    }
+
+    #[test]
+    fn test_generate_totp_code() {
+        // Use a test secret that meets the 128-bit minimum (26+ Base32 chars)
+        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+        let result = generate_totp_code(secret);
+        assert!(result.is_ok(), "Error: {:?}", result);
+        let (code, remaining) = result.unwrap();
+        // Code should be 6 digits
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
+        // Remaining should be 1-30 seconds
+        assert!(remaining >= 1 && remaining <= 30);
+    }
+
+    #[test]
+    fn test_generate_totp_code_invalid_secret() {
+        let result = generate_totp_code("invalid!secret");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_entry_with_totp() {
+        let secret = generate_totp_secret();
+        let entry = create_entry_with_totp(
+            "example.com".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            vec!["Work".to_string()],
+            Some(secret.clone()),
+        );
+
+        assert_eq!(entry.website, "example.com");
+        assert_eq!(entry.totp_secret, Some(secret));
     }
 }

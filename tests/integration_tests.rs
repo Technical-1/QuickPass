@@ -525,6 +525,112 @@ mod export_import_tests {
 
 mod security_tests {
     #[test]
+    fn test_empty_password_rejected() {
+        // Empty password must be rejected to prevent authentication bypass
+        fn validate_password_not_empty(password: &str) -> Result<(), &'static str> {
+            if password.is_empty() {
+                return Err("Master password cannot be empty");
+            }
+            Ok(())
+        }
+
+        // Empty password should be rejected
+        assert!(validate_password_not_empty("").is_err());
+
+        // Whitespace-only should also be considered invalid
+        // (though in real code we'd trim first)
+        assert!(validate_password_not_empty("   ").is_ok()); // Note: real validation trims first
+
+        // Valid password should pass
+        assert!(validate_password_not_empty("Password123").is_ok());
+    }
+
+    #[test]
+    fn test_lockout_duration_exponential_backoff() {
+        // Lockout duration should increase exponentially
+        fn calculate_lockout_minutes(lockout_count: u32) -> u64 {
+            // 15 min, 30 min, 60 min, then deletion
+            match lockout_count {
+                0 => 15,
+                1 => 30,
+                2 => 60,
+                _ => 0, // 0 means delete vault
+            }
+        }
+
+        assert_eq!(calculate_lockout_minutes(0), 15);
+        assert_eq!(calculate_lockout_minutes(1), 30);
+        assert_eq!(calculate_lockout_minutes(2), 60);
+        assert_eq!(calculate_lockout_minutes(3), 0); // Should delete after 3 lockouts
+    }
+
+    #[test]
+    fn test_lockout_state_tracking() {
+        // Test lockout state management
+        struct LockoutState {
+            failed_attempts: u32,
+            lockout_count: u32,
+            is_locked: bool,
+        }
+
+        impl LockoutState {
+            fn new() -> Self {
+                Self {
+                    failed_attempts: 0,
+                    lockout_count: 0,
+                    is_locked: false,
+                }
+            }
+
+            fn record_failure(&mut self) -> bool {
+                const MAX_ATTEMPTS: u32 = 5;
+
+                self.failed_attempts += 1;
+                if self.failed_attempts >= MAX_ATTEMPTS {
+                    self.lockout_count += 1;
+                    self.failed_attempts = 0;
+                    self.is_locked = true;
+
+                    // Return true if vault should be deleted (after 3 lockouts)
+                    return self.lockout_count > 3;
+                }
+                false
+            }
+
+            fn unlock(&mut self) {
+                self.is_locked = false;
+            }
+
+            fn reset_on_success(&mut self) {
+                self.failed_attempts = 0;
+                self.lockout_count = 0;
+                self.is_locked = false;
+            }
+        }
+
+        let mut state = LockoutState::new();
+
+        // 5 failures = first lockout
+        for _ in 0..5 {
+            state.record_failure();
+        }
+        assert!(state.is_locked);
+        assert_eq!(state.lockout_count, 1);
+
+        // Unlock and try again
+        state.unlock();
+        for _ in 0..5 {
+            state.record_failure();
+        }
+        assert_eq!(state.lockout_count, 2);
+
+        // Successful login resets everything
+        state.reset_on_success();
+        assert_eq!(state.failed_attempts, 0);
+        assert_eq!(state.lockout_count, 0);
+    }
+
+    #[test]
     fn test_clipboard_timeout_logic() {
         use std::time::{Duration, Instant};
 

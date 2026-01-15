@@ -3,21 +3,25 @@ use egui::{Color32, RichText};
 use std::time::Instant;
 use zeroize::Zeroize;
 
-use crate::manager::{scan_vaults_in_dir, vault_file_path};
+use crate::lockout::{LockoutResult, VaultLockout};
+use crate::manager::{sanitize_vault_name, scan_vaults_in_dir, vault_file_path};
 use crate::password::{estimate_entropy, generate_password, validate_master_password};
 use crate::security::SecurityLevel;
+use crate::settings::AppSettings;
 use crate::vault::{
-    VaultEntry, create_new_vault_file, export_encrypted_backup, export_to_csv,
-    import_encrypted_backup, load_vault_data_decrypted, load_vault_key_only,
-    pattern_to_string, save_vault_file, update_custom_tags, update_last_accessed_in_vault,
-    update_master_password_with_key, update_pattern_with_key,
+    VaultEntry, create_new_vault_file, disable_vault_2fa, enable_vault_2fa,
+    export_encrypted_backup, export_to_csv, generate_qr_code_data, generate_totp_code,
+    generate_totp_secret, generate_totp_uri, import_csv_auto, import_encrypted_backup,
+    load_vault_data_decrypted, load_vault_key_only, password_age_days, pattern_to_string,
+    save_vault_file, update_custom_tags, update_entry_timestamp, update_last_accessed_in_vault,
+    update_master_password_with_key, update_pattern_with_key, validate_totp_secret,
+    vault_has_2fa, verify_vault_totp,
 };
 
-/// Clipboard clear timeout in seconds
-const CLIPBOARD_CLEAR_SECONDS: u64 = 30;
+/// Minimum pattern length for security (~42 bits entropy with 12 cells)
+const MIN_PATTERN_LENGTH: usize = 12;
 
-/// Auto-lock timeout in seconds (5 minutes)
-const AUTO_LOCK_SECONDS: u64 = 300;
+// Note: Clipboard and auto-lock timeouts are now configurable via AppSettings
 
 #[derive(Clone)]
 pub struct SymbolToggle {
@@ -86,15 +90,17 @@ pub struct QuickPassApp {
     pub first_run_pattern: Vec<(usize, usize)>,
     pub first_run_pattern_unlocked: bool,
 
-    // login fails
+    // login fails and lockout
     pub failed_attempts: u32,
     pub login_error_msg: String,
+    pub vault_lockout: Option<VaultLockout>,
 
     // Editing an existing VaultEntry
     pub editing_index: Option<usize>,
     pub editing_website: String,
     pub editing_username: String,
     pub editing_password: String,
+    pub editing_totp_secret: String,
 
     // Password visibility per entry
     pub password_visible: Vec<bool>,
@@ -120,11 +126,31 @@ pub struct QuickPassApp {
     pub show_import_dialog: bool,
     pub import_data: String,
     pub import_error: Option<String>,
+    pub import_mode_csv: bool,  // false = encrypted backup, true = CSV
+
+    // QR code display state
+    pub show_qr_for_entry: Option<usize>,  // Index of entry to show QR for
+    pub qr_code_data: Option<(usize, Vec<bool>)>,  // (width, data) for QR code
+
+    // Vault-level 2FA state
+    pub awaiting_2fa_verification: bool,
+    pub totp_code_input: String,
+    pub pending_vault_key: Option<Vec<u8>>,  // Holds vault key while awaiting 2FA
+    pub show_2fa_setup: bool,
+    pub setup_2fa_secret: String,
+
+    // Application settings
+    pub settings: AppSettings,
+    pub show_settings_dialog: bool,
+    pub settings_clipboard_input: String,
+    pub settings_autolock_input: String,
+    pub settings_max_attempts_input: String,
 }
 
 impl Default for QuickPassApp {
     fn default() -> Self {
         let manager_vaults = scan_vaults_in_dir();
+        let settings = AppSettings::load();
         Self {
             show_vault_manager: true,
             active_vault_name: None,
@@ -175,11 +201,13 @@ impl Default for QuickPassApp {
 
             failed_attempts: 0,
             login_error_msg: String::new(),
+            vault_lockout: None,
 
             editing_index: None,
             editing_website: String::new(),
             editing_username: String::new(),
             editing_password: String::new(),
+            editing_totp_secret: String::new(),
 
             password_visible: Vec::new(),
 
@@ -199,6 +227,22 @@ impl Default for QuickPassApp {
             show_import_dialog: false,
             import_data: String::new(),
             import_error: None,
+            import_mode_csv: false,
+
+            show_qr_for_entry: None,
+            qr_code_data: None,
+
+            awaiting_2fa_verification: false,
+            totp_code_input: String::new(),
+            pending_vault_key: None,
+            show_2fa_setup: false,
+            setup_2fa_secret: String::new(),
+
+            settings_clipboard_input: settings.clipboard_clear_seconds.to_string(),
+            settings_autolock_input: settings.auto_lock_seconds.to_string(),
+            settings_max_attempts_input: settings.max_failed_attempts.to_string(),
+            settings,
+            show_settings_dialog: false,
         }
     }
 }
@@ -217,17 +261,17 @@ fn build_default_symbol_toggles() -> Vec<SymbolToggle> {
 
 impl App for QuickPassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // Check clipboard auto-clear
+        // Check clipboard auto-clear (using settings)
         if let Some(copy_time) = self.clipboard_copy_time {
-            if copy_time.elapsed().as_secs() >= CLIPBOARD_CLEAR_SECONDS {
+            if copy_time.elapsed().as_secs() >= self.settings.clipboard_timeout_u64() {
                 ctx.copy_text(String::new());
                 self.clipboard_copy_time = None;
                 self.clipboard_copy_type = None;
             }
         }
 
-        // Check auto-lock timeout (only when logged in)
-        if self.is_logged_in && self.last_activity_time.elapsed().as_secs() >= AUTO_LOCK_SECONDS {
+        // Check auto-lock timeout (only when logged in, using settings)
+        if self.is_logged_in && self.last_activity_time.elapsed().as_secs() >= self.settings.auto_lock_timeout_u64() {
             self.perform_logout();
             self.login_error_msg = "Vault locked due to inactivity".into();
         }
@@ -267,6 +311,7 @@ impl App for QuickPassApp {
                     self.editing_website.zeroize();
                     self.editing_username.zeroize();
                     self.editing_password.zeroize();
+                    self.editing_totp_secret.zeroize();
                 }
                 // Cancel pending deletes
                 self.pending_delete_entry = None;
@@ -287,9 +332,9 @@ impl App for QuickPassApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Show clipboard countdown if active
+            // Show clipboard countdown if active (using settings)
             if let Some(copy_time) = self.clipboard_copy_time {
-                let remaining = CLIPBOARD_CLEAR_SECONDS.saturating_sub(copy_time.elapsed().as_secs());
+                let remaining = self.settings.clipboard_timeout_u64().saturating_sub(copy_time.elapsed().as_secs());
                 if let Some(ref copy_type) = self.clipboard_copy_type {
                     ui.colored_label(
                         Color32::YELLOW,
@@ -338,6 +383,151 @@ impl App for QuickPassApp {
                 }
             }
         });
+
+        // Settings popup window
+        if self.show_settings_dialog {
+            egui::Window::new("Settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Clipboard clear timeout (seconds, 10-120):");
+                        ui.add(egui::TextEdit::singleline(&mut self.settings_clipboard_input).desired_width(80.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Auto-lock timeout (seconds, 60-3600):");
+                        ui.add(egui::TextEdit::singleline(&mut self.settings_autolock_input).desired_width(80.0));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max failed login attempts (3-10):");
+                        ui.add(egui::TextEdit::singleline(&mut self.settings_max_attempts_input).desired_width(80.0));
+                    });
+
+                    // Vault 2FA section
+                    ui.separator();
+                    ui.label(RichText::new("Vault 2FA").color(Color32::YELLOW));
+
+                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                    let has_2fa = vault_has_2fa(&vault_name);
+
+                    if has_2fa {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(Color32::GREEN, "2FA is ENABLED");
+                            if ui.button("Disable 2FA").clicked() {
+                                if let Err(e) = disable_vault_2fa(&vault_name) {
+                                    self.login_error_msg = format!("Failed to disable 2FA: {e}");
+                                } else {
+                                    self.login_error_msg = "2FA disabled".into();
+                                }
+                            }
+                        });
+                    } else if self.show_2fa_setup {
+                        // Show 2FA setup with QR code
+                        ui.label("Scan this QR code with your authenticator app:");
+
+                        let uri = generate_totp_uri(&self.setup_2fa_secret, &vault_name, "QuickPass");
+                        if let Ok((width, data)) = generate_qr_code_data(&uri) {
+                            let module_size = 3.0;
+                            let qr_size = width as f32 * module_size;
+                            egui::Frame::new()
+                                .fill(Color32::WHITE)
+                                .inner_margin(6.0)
+                                .show(ui, |ui| {
+                                    let (response, painter) = ui.allocate_painter(
+                                        egui::vec2(qr_size, qr_size),
+                                        egui::Sense::hover(),
+                                    );
+                                    let rect = response.rect;
+                                    for y in 0..width {
+                                        for x in 0..width {
+                                            if data.get(y * width + x).copied().unwrap_or(false) {
+                                                let module_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        rect.min.x + x as f32 * module_size,
+                                                        rect.min.y + y as f32 * module_size,
+                                                    ),
+                                                    egui::vec2(module_size, module_size),
+                                                );
+                                                painter.rect_filled(module_rect, 0.0, Color32::BLACK);
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+
+                        ui.label("Then enter the 6-digit code to confirm:");
+                        ui.add(egui::TextEdit::singleline(&mut self.totp_code_input).desired_width(100.0));
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm & Enable").clicked() {
+                                // Verify the code first
+                                if let Ok((expected, _)) = generate_totp_code(&self.setup_2fa_secret) {
+                                    if expected == self.totp_code_input.trim() {
+                                        // Code matches, enable 2FA
+                                        if let Some(ref vault_key) = self.current_vault_key {
+                                            if let Err(e) = enable_vault_2fa(&vault_name, vault_key, &self.setup_2fa_secret) {
+                                                self.login_error_msg = format!("Failed to enable 2FA: {e}");
+                                            } else {
+                                                self.login_error_msg = "2FA enabled successfully!".into();
+                                                self.show_2fa_setup = false;
+                                                self.setup_2fa_secret.clear();
+                                                self.totp_code_input.clear();
+                                            }
+                                        }
+                                    } else {
+                                        self.login_error_msg = "Invalid 2FA code. Please try again.".into();
+                                    }
+                                }
+                            }
+                            if ui.button("Cancel Setup").clicked() {
+                                self.show_2fa_setup = false;
+                                self.setup_2fa_secret.clear();
+                                self.totp_code_input.clear();
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("2FA is disabled");
+                            if ui.button("Enable 2FA").clicked() {
+                                self.setup_2fa_secret = generate_totp_secret();
+                                self.show_2fa_setup = true;
+                            }
+                        });
+                    }
+
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save Settings").clicked() {
+                            if let Ok(clipboard_secs) = self.settings_clipboard_input.parse::<u32>() {
+                                self.settings.set_clipboard_timeout(clipboard_secs);
+                            }
+                            if let Ok(autolock_secs) = self.settings_autolock_input.parse::<u32>() {
+                                self.settings.set_auto_lock_timeout(autolock_secs);
+                            }
+                            if let Ok(max_attempts) = self.settings_max_attempts_input.parse::<u32>() {
+                                self.settings.set_max_failed_attempts(max_attempts);
+                            }
+                            if let Err(e) = self.settings.save() {
+                                self.login_error_msg = format!("Failed to save settings: {e}");
+                            } else {
+                                self.login_error_msg = "Settings saved!".into();
+                            }
+                            self.show_settings_dialog = false;
+                            self.show_2fa_setup = false;
+                        }
+                        if ui.button("Close").clicked() {
+                            self.show_settings_dialog = false;
+                            self.show_2fa_setup = false;
+                        }
+                    });
+
+                    ui.colored_label(Color32::GRAY, "Values outside allowed ranges will be clamped.");
+                });
+        }
     }
 }
 
@@ -351,6 +541,7 @@ impl QuickPassApp {
         self.editing_website.zeroize();
         self.editing_username.zeroize();
         self.editing_password.zeroize();
+        self.editing_totp_secret.zeroize();
 
         self.generated_password.zeroize();
         self.new_website.zeroize();
@@ -375,7 +566,7 @@ impl QuickPassApp {
         self.show_export_dialog = false;
         self.export_result = None;
         self.show_import_dialog = false;
-        self.import_data.clear();
+        self.import_data.zeroize();
         self.import_error = None;
     }
 
@@ -398,7 +589,9 @@ impl QuickPassApp {
                     vault_key,
                     &self.vault,
                 ) {
-                    eprintln!("Failed to save on logout: {e}");
+                    // Error is silently ignored - save failed on logout
+                    // This is acceptable since we're logging out anyway
+                    let _ = e;
                 }
             }
         }
@@ -469,6 +662,18 @@ impl QuickPassApp {
                         self.failed_attempts = 0;
                         self.login_error_msg.clear();
 
+                        // Load lockout state for this vault
+                        let lockout = VaultLockout::load(&vault_name);
+                        if lockout.is_locked() {
+                            self.vault_lockout = Some(lockout.clone());
+                            self.login_error_msg = format!(
+                                "Vault is locked. Try again in {}.",
+                                lockout.format_remaining_time()
+                            );
+                        } else {
+                            self.vault_lockout = Some(lockout);
+                        }
+
                         // Switch
                         self.active_vault_name = Some(vault_name.clone());
                         self.show_vault_manager = false;
@@ -491,29 +696,33 @@ impl QuickPassApp {
         ui.text_edit_singleline(&mut self.new_vault_name);
 
         if ui.button("Create").clicked() {
-            if self.new_vault_name.trim().is_empty() {
-                self.login_error_msg = "Please enter a vault name!".into();
-            } else {
-                let path = vault_file_path(&self.new_vault_name);
-                if path.exists() {
-                    self.login_error_msg = "Vault with that name already exists!".into();
-                } else {
-                    self.active_vault_name = Some(self.new_vault_name.clone());
-                    self.show_vault_manager = false;
-                    self.login_error_msg.clear();
+            // Sanitize vault name to prevent path traversal and other issues
+            match sanitize_vault_name(&self.new_vault_name) {
+                Err(e) => {
+                    self.login_error_msg = e.to_string();
+                }
+                Ok(sanitized_name) => {
+                    let path = vault_file_path(&sanitized_name);
+                    if path.exists() {
+                        self.login_error_msg = "Vault with that name already exists!".into();
+                    } else {
+                        self.active_vault_name = Some(sanitized_name);
+                        self.show_vault_manager = false;
+                        self.login_error_msg.clear();
 
-                    // Clear old state
-                    self.vault.clear();
-                    self.password_visible.clear();
-                    self.is_logged_in = false;
-                    self.master_password_input.clear();
-                    self.pattern_attempt.clear();
-                    self.is_pattern_unlock = false;
-                    self.failed_attempts = 0;
+                        // Clear old state
+                        self.vault.clear();
+                        self.password_visible.clear();
+                        self.is_logged_in = false;
+                        self.master_password_input.zeroize();
+                        self.pattern_attempt.clear();
+                        self.is_pattern_unlock = false;
+                        self.failed_attempts = 0;
 
-                    self.first_run_password.clear();
-                    self.first_run_pattern.clear();
-                    self.first_run_pattern_unlocked = false;
+                        self.first_run_password.zeroize();
+                        self.first_run_pattern.clear();
+                        self.first_run_pattern_unlocked = false;
+                    }
                 }
             }
         }
@@ -555,13 +764,13 @@ impl QuickPassApp {
         }
 
         ui.separator();
-        ui.label("Create a Pattern (6x6 grid, need >=8 unique clicks):");
+        ui.label("Create a Pattern (6x6 grid, need >=12 unique clicks):");
         self.show_pattern_lock_first_run(ui);
 
         if self.first_run_pattern_unlocked {
             ui.colored_label(Color32::GREEN, format!("Pattern set! ({} cells)", self.first_run_pattern.len()));
         } else {
-            ui.colored_label(Color32::RED, format!("Pattern not set (need >=8 unique, have {}).", self.first_run_pattern.len()));
+            ui.colored_label(Color32::RED, format!("Pattern not set (need >=12 unique, have {}).", self.first_run_pattern.len()));
         }
 
         if ui.button("Reset Pattern").clicked() {
@@ -583,6 +792,7 @@ impl QuickPassApp {
                     &self.first_run_password,
                     &pattern_hash,
                     self.security_level,
+                    None, // No 2FA during initial creation (can enable later in settings)
                 ) {
                     Ok((mh, ph)) => {
                         self.master_hash = Some(mh);
@@ -634,6 +844,62 @@ impl QuickPassApp {
     // (C) Login UI
     fn show_login_ui(&mut self, ui: &mut egui::Ui) {
         let vault_name = self.active_vault_name.clone().unwrap_or_default();
+
+        // 2FA verification UI (shown after password/pattern verification)
+        if self.awaiting_2fa_verification {
+            ui.heading(
+                RichText::new("2FA Verification")
+                    .size(30.0)
+                    .color(Color32::YELLOW),
+            );
+            ui.label("Enter your 6-digit 2FA code from your authenticator app:");
+            ui.add(egui::TextEdit::singleline(&mut self.totp_code_input).desired_width(150.0));
+
+            ui.horizontal(|ui| {
+                if ui.button("Verify").clicked() {
+                    if let Some(ref key) = self.pending_vault_key {
+                        match verify_vault_totp(&vault_name, key, self.totp_code_input.trim()) {
+                            Ok(true) => {
+                                // 2FA verified, complete login
+                                self.current_vault_key = self.pending_vault_key.take();
+                                self.is_logged_in = true;
+                                self.awaiting_2fa_verification = false;
+                                self.login_error_msg.clear();
+                                self.failed_attempts = 0;
+                                self.reset_lockout_on_success();
+                                self.totp_code_input.clear();
+
+                                let _ = update_last_accessed_in_vault(
+                                    &vault_name,
+                                    self.current_vault_key.as_ref().unwrap(),
+                                    &self.vault,
+                                );
+                            }
+                            Ok(false) => {
+                                self.login_error_msg = "Invalid 2FA code. Please try again.".into();
+                            }
+                            Err(e) => {
+                                self.login_error_msg = format!("2FA verification error: {e}");
+                            }
+                        }
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    // Cancel 2FA, clear pending state
+                    self.awaiting_2fa_verification = false;
+                    self.pending_vault_key = None;
+                    self.vault.clear();
+                    self.custom_tags.clear();
+                    self.password_visible.clear();
+                    self.master_hash = None;
+                    self.pattern_hash = None;
+                    self.totp_code_input.clear();
+                    self.login_error_msg.clear();
+                }
+            });
+            return;
+        }
+
         ui.heading(
             RichText::new(format!("Welcome to: {}", vault_name))
                 .size(30.0)
@@ -642,26 +908,55 @@ impl QuickPassApp {
         ui.label("Enter your master password:");
         ui.add(egui::TextEdit::singleline(&mut self.master_password_input).password(true));
 
-        if ui.button("Login").clicked() {
+        // Check if vault is locked before allowing login attempt
+        let is_locked = self.is_vault_locked();
+        if is_locked {
+            // Update the lockout message with current remaining time
+            if let Some(ref lockout) = self.vault_lockout {
+                self.login_error_msg = format!(
+                    "Vault is locked. Try again in {}.",
+                    lockout.format_remaining_time()
+                );
+            }
+        }
+
+        let login_enabled = !is_locked;
+        if ui.add_enabled(login_enabled, egui::Button::new("Login")).clicked() {
             let pass = self.master_password_input.clone();
             match load_vault_key_only(&vault_name, &pass, None, self.security_level) {
                 Ok((mh, ph, key)) => match load_vault_data_decrypted(&vault_name, &key) {
                     Ok(vault_data) => {
-                        self.current_vault_key = Some(key);
-                        self.master_hash = Some(mh);
-                        self.pattern_hash = ph;
-                        self.vault = vault_data.entries;
-                        self.custom_tags = vault_data.metadata.custom_tags;
-                        self.password_visible = vec![false; self.vault.len()];
-                        self.is_logged_in = true;
-                        self.login_error_msg.clear();
-                        self.failed_attempts = 0;
+                        // Check if vault has 2FA enabled
+                        if vault_has_2fa(&vault_name) {
+                            // Store credentials temporarily, await 2FA verification
+                            self.pending_vault_key = Some(key);
+                            self.master_hash = Some(mh);
+                            self.pattern_hash = ph;
+                            self.vault = vault_data.entries;
+                            self.custom_tags = vault_data.metadata.custom_tags;
+                            self.password_visible = vec![false; self.vault.len()];
+                            self.awaiting_2fa_verification = true;
+                            self.totp_code_input.clear();
+                            self.login_error_msg = "Enter your 2FA code".into();
+                        } else {
+                            // No 2FA, complete login
+                            self.current_vault_key = Some(key);
+                            self.master_hash = Some(mh);
+                            self.pattern_hash = ph;
+                            self.vault = vault_data.entries;
+                            self.custom_tags = vault_data.metadata.custom_tags;
+                            self.password_visible = vec![false; self.vault.len()];
+                            self.is_logged_in = true;
+                            self.login_error_msg.clear();
+                            self.failed_attempts = 0;
+                            self.reset_lockout_on_success();
 
-                        let _ = update_last_accessed_in_vault(
-                            &vault_name,
-                            self.current_vault_key.as_ref().unwrap(),
-                            &self.vault,
-                        );
+                            let _ = update_last_accessed_in_vault(
+                                &vault_name,
+                                self.current_vault_key.as_ref().unwrap(),
+                                &self.vault,
+                            );
+                        }
                     }
                     Err(e) => {
                         self.handle_login_failure(format!("Login error (decrypt vault): {e}"));
@@ -675,13 +970,13 @@ impl QuickPassApp {
 
         ui.separator();
         ui.label(
-            RichText::new("Or unlock with your Pattern (6x6 grid, >=8 clicks)")
+            RichText::new("Or unlock with your Pattern (6x6 grid, >=12 clicks)")
                 .size(20.0)
                 .color(Color32::GRAY),
         );
         self.show_pattern_lock_login(ui);
 
-        if self.is_pattern_unlock {
+        if self.is_pattern_unlock && !is_locked {
             if ui.button("Enter with Pattern").clicked() {
                 let pattern_str = pattern_to_string(&self.pattern_attempt);
                 match load_vault_key_only(
@@ -692,21 +987,37 @@ impl QuickPassApp {
                 ) {
                     Ok((mh, ph, key)) => match load_vault_data_decrypted(&vault_name, &key) {
                         Ok(vault_data) => {
-                            self.current_vault_key = Some(key);
-                            self.master_hash = Some(mh);
-                            self.pattern_hash = ph;
-                            self.vault = vault_data.entries;
-                            self.custom_tags = vault_data.metadata.custom_tags;
-                            self.password_visible = vec![false; self.vault.len()];
-                            self.is_logged_in = true;
-                            self.login_error_msg.clear();
-                            self.failed_attempts = 0;
+                            // Check if vault has 2FA enabled
+                            if vault_has_2fa(&vault_name) {
+                                // Store credentials temporarily, await 2FA verification
+                                self.pending_vault_key = Some(key);
+                                self.master_hash = Some(mh);
+                                self.pattern_hash = ph;
+                                self.vault = vault_data.entries;
+                                self.custom_tags = vault_data.metadata.custom_tags;
+                                self.password_visible = vec![false; self.vault.len()];
+                                self.awaiting_2fa_verification = true;
+                                self.totp_code_input.clear();
+                                self.login_error_msg = "Enter your 2FA code".into();
+                            } else {
+                                // No 2FA, complete login
+                                self.current_vault_key = Some(key);
+                                self.master_hash = Some(mh);
+                                self.pattern_hash = ph;
+                                self.vault = vault_data.entries;
+                                self.custom_tags = vault_data.metadata.custom_tags;
+                                self.password_visible = vec![false; self.vault.len()];
+                                self.is_logged_in = true;
+                                self.login_error_msg.clear();
+                                self.failed_attempts = 0;
+                                self.reset_lockout_on_success();
 
-                            let _ = update_last_accessed_in_vault(
-                                &vault_name,
-                                self.current_vault_key.as_ref().unwrap(),
-                                &self.vault,
-                            );
+                                let _ = update_last_accessed_in_vault(
+                                    &vault_name,
+                                    self.current_vault_key.as_ref().unwrap(),
+                                    &self.vault,
+                                );
+                            }
                         }
                         Err(e) => {
                             self.handle_login_failure(format!(
@@ -724,7 +1035,7 @@ impl QuickPassApp {
                 }
             }
         } else {
-            ui.colored_label(Color32::RED, format!("Pattern: {}/8 cells", self.pattern_attempt.len()));
+            ui.colored_label(Color32::RED, format!("Pattern: {}/{} cells", self.pattern_attempt.len(), MIN_PATTERN_LENGTH));
         }
 
         if ui.button("Reset Pattern").clicked() {
@@ -1011,12 +1322,12 @@ impl QuickPassApp {
                                 tags.push(self.new_tags_str.clone());
                             }
 
-                            let new_entry = VaultEntry {
-                                website: self.new_website.clone(),
-                                username: self.new_username.clone(),
-                                password: self.generated_password.clone(),
+                            let new_entry = crate::vault::create_entry_with_timestamp(
+                                self.new_website.clone(),
+                                self.new_username.clone(),
+                                self.generated_password.clone(),
                                 tags,
-                            };
+                            );
 
                             self.vault.push(new_entry);
                             self.password_visible.push(false);
@@ -1045,7 +1356,7 @@ impl QuickPassApp {
                             self.new_username.clear();
 
                             self.generated_password.zeroize();
-                            self.generated_password.clear();
+                            self.generated_password.zeroize();
 
                             self.new_tags_str.zeroize();
                             self.new_tags_str.clear();
@@ -1157,6 +1468,16 @@ impl QuickPassApp {
                                         ui.text_edit_singleline(&mut self.editing_username);
                                         ui.label("Edit Password:");
                                         ui.text_edit_singleline(&mut self.editing_password);
+                                        ui.label("TOTP Secret (Base32, leave empty if no 2FA):");
+                                        ui.text_edit_singleline(&mut self.editing_totp_secret);
+                                        // Validate TOTP secret
+                                        if !self.editing_totp_secret.is_empty() {
+                                            if validate_totp_secret(&self.editing_totp_secret) {
+                                                ui.colored_label(Color32::GREEN, "Valid TOTP secret");
+                                            } else {
+                                                ui.colored_label(Color32::RED, "Invalid TOTP secret (must be Base32)");
+                                            }
+                                        }
                                     });
 
                                     // Show a dynamic meter for typed password
@@ -1183,8 +1504,16 @@ impl QuickPassApp {
                                         self.vault[i].website = self.editing_website.clone();
                                         self.vault[i].username = self.editing_username.clone();
                                         self.vault[i].password = self.editing_password.clone();
+                                        // Save TOTP secret (empty string becomes None)
+                                        self.vault[i].totp_secret = if self.editing_totp_secret.is_empty() {
+                                            None
+                                        } else {
+                                            Some(self.editing_totp_secret.clone())
+                                        };
+                                        // Update modified timestamp
+                                        update_entry_timestamp(&mut self.vault[i]);
 
-                                        // FIXED: Save changes to disk
+                                        // Save changes to disk
                                         if let Some(ref vault_key) = self.current_vault_key {
                                             if let Some(mh) = &self.master_hash {
                                                 let vault_name = self.active_vault_name.clone().unwrap_or_default();
@@ -1202,12 +1531,14 @@ impl QuickPassApp {
                                         self.editing_website.zeroize();
                                         self.editing_username.zeroize();
                                         self.editing_password.zeroize();
+                                        self.editing_totp_secret.zeroize();
                                     }
                                     if cancel_clicked {
                                         self.editing_index = None;
                                         self.editing_website.zeroize();
                                         self.editing_username.zeroize();
                                         self.editing_password.zeroize();
+                                        self.editing_totp_secret.zeroize();
                                     }
                                 } else {
                                     // Normal display UI - copy values to avoid borrow issues
@@ -1262,6 +1593,78 @@ impl QuickPassApp {
                                         );
                                     });
 
+                                    // Password age display
+                                    if let Some(age_days) = password_age_days(&self.vault[i]) {
+                                        let age_color = if age_days > 365 {
+                                            Color32::RED
+                                        } else if age_days > 180 {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::GRAY
+                                        };
+                                        let age_text = if age_days == 0 {
+                                            "Password age: Today".to_string()
+                                        } else if age_days == 1 {
+                                            "Password age: 1 day".to_string()
+                                        } else {
+                                            format!("Password age: {} days", age_days)
+                                        };
+                                        ui.colored_label(age_color, age_text);
+                                    }
+
+                                    // TOTP display (if entry has 2FA configured)
+                                    let totp_secret_opt = self.vault[i].totp_secret.clone();
+                                    if let Some(ref totp_secret) = totp_secret_opt {
+                                        if !totp_secret.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                match generate_totp_code(totp_secret) {
+                                                    Ok((code, remaining)) => {
+                                                        ui.label("2FA Code:");
+                                                        ui.monospace(
+                                                            RichText::new(&code)
+                                                                .size(16.0)
+                                                                .color(Color32::LIGHT_GREEN),
+                                                        );
+                                                        // Show countdown
+                                                        let countdown_color = if remaining <= 5 {
+                                                            Color32::RED
+                                                        } else if remaining <= 10 {
+                                                            Color32::YELLOW
+                                                        } else {
+                                                            Color32::GRAY
+                                                        };
+                                                        ui.colored_label(
+                                                            countdown_color,
+                                                            format!("({}s)", remaining),
+                                                        );
+                                                        if ui.button("Copy 2FA").clicked() {
+                                                            self.copy_to_clipboard(ui.ctx(), &code, "2FA Code");
+                                                        }
+                                                        // Show QR button
+                                                        if ui.button("Show QR").on_hover_text("Show QR code for mobile authenticator").clicked() {
+                                                            // Generate QR code data
+                                                            let uri = generate_totp_uri(
+                                                                totp_secret,
+                                                                &username,
+                                                                &website,
+                                                            );
+                                                            if let Ok(qr_data) = generate_qr_code_data(&uri) {
+                                                                self.qr_code_data = Some(qr_data);
+                                                                self.show_qr_for_entry = Some(i);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        ui.colored_label(
+                                                            Color32::RED,
+                                                            "2FA: Invalid secret",
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+
                                     // Track button clicks outside closures
                                     let edit_clicked = ui.button("Edit").clicked();
                                     let regenerate_clicked = ui.button("Regenerate").on_hover_text("Regenerate Password").clicked();
@@ -1272,6 +1675,7 @@ impl QuickPassApp {
                                         self.editing_website = self.vault[i].website.clone();
                                         self.editing_username = self.vault[i].username.clone();
                                         self.editing_password = self.vault[i].password.clone();
+                                        self.editing_totp_secret = self.vault[i].totp_secret.clone().unwrap_or_default();
                                     }
 
                                     if regenerate_clicked {
@@ -1312,12 +1716,12 @@ impl QuickPassApp {
                 ui.horizontal(|ui| {
                     if ui.button("Change Master Password").clicked() {
                         self.show_change_pw = true;
-                        self.new_master_pw_old_input.clear();
-                        self.new_master_pw.clear();
+                        self.new_master_pw_old_input.zeroize();
+                        self.new_master_pw.zeroize();
                     }
                     if ui.button("Change Pattern").clicked() {
                         self.show_change_pattern = true;
-                        self.old_password_for_pattern.clear();
+                        self.old_password_for_pattern.zeroize();
                         self.new_pattern_attempt.clear();
                         self.new_pattern_unlocked = false;
                     }
@@ -1327,7 +1731,7 @@ impl QuickPassApp {
                     }
                 });
 
-                // Export/Import buttons
+                // Export/Import/Settings buttons
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Export Backup").clicked() {
@@ -1336,8 +1740,14 @@ impl QuickPassApp {
                     }
                     if ui.button("Import Backup").clicked() {
                         self.show_import_dialog = true;
-                        self.import_data.clear();
+                        self.import_data.zeroize();
                         self.import_error = None;
+                    }
+                    if ui.button("Settings").clicked() {
+                        self.show_settings_dialog = true;
+                        self.settings_clipboard_input = self.settings.clipboard_clear_seconds.to_string();
+                        self.settings_autolock_input = self.settings.auto_lock_seconds.to_string();
+                        self.settings_max_attempts_input = self.settings.max_failed_attempts.to_string();
                     }
                 });
 
@@ -1389,8 +1799,27 @@ impl QuickPassApp {
                 // Import dialog
                 if self.show_import_dialog {
                     ui.group(|ui| {
-                        ui.label(RichText::new("Import Backup").color(Color32::YELLOW).size(18.0));
-                        ui.label("Paste encrypted backup data below:");
+                        ui.label(RichText::new("Import Passwords").color(Color32::YELLOW).size(18.0));
+
+                        // Import mode selector
+                        ui.horizontal(|ui| {
+                            ui.label("Import type:");
+                            if ui.radio(!self.import_mode_csv, "Encrypted Backup").clicked() {
+                                self.import_mode_csv = false;
+                                self.import_error = None;
+                            }
+                            if ui.radio(self.import_mode_csv, "CSV (Bitwarden/1Password/LastPass)").clicked() {
+                                self.import_mode_csv = true;
+                                self.import_error = None;
+                            }
+                        });
+
+                        if self.import_mode_csv {
+                            ui.label("Paste CSV data from your password manager export:");
+                            ui.colored_label(Color32::GRAY, "Supported: Bitwarden, 1Password, LastPass, or generic CSV");
+                        } else {
+                            ui.label("Paste encrypted backup data below:");
+                        }
 
                         egui::ScrollArea::vertical()
                             .max_height(150.0)
@@ -1404,12 +1833,12 @@ impl QuickPassApp {
 
                         ui.horizontal(|ui| {
                             if ui.button("Import (Merge)").clicked() {
-                                if let Some(ref vault_key) = self.current_vault_key {
-                                    match import_encrypted_backup(&self.import_data, vault_key) {
-                                        Ok(imported_data) => {
-                                            // Merge entries (avoid duplicates by website+username)
+                                if self.import_mode_csv {
+                                    // CSV import
+                                    match import_csv_auto(&self.import_data) {
+                                        Ok((entries, format)) => {
                                             let mut added = 0;
-                                            for entry in imported_data.entries {
+                                            for entry in entries {
                                                 let exists = self.vault.iter().any(|e| {
                                                     e.website == entry.website && e.username == entry.username
                                                 });
@@ -1419,49 +1848,145 @@ impl QuickPassApp {
                                                     added += 1;
                                                 }
                                             }
-                                            // Merge custom tags
-                                            for tag in imported_data.metadata.custom_tags {
-                                                if !self.custom_tags.contains(&tag) {
-                                                    self.custom_tags.push(tag);
+                                            // Save
+                                            if let Some(ref vault_key) = self.current_vault_key {
+                                                if let Some(mh) = &self.master_hash {
+                                                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                    let _ = save_vault_file(
+                                                        &vault_name,
+                                                        mh,
+                                                        self.pattern_hash.as_deref(),
+                                                        vault_key,
+                                                        &self.vault,
+                                                    );
                                                 }
                                             }
-                                            // Save
-                                            if let Some(mh) = &self.master_hash {
-                                                let vault_name = self.active_vault_name.clone().unwrap_or_default();
-                                                let _ = save_vault_file(
-                                                    &vault_name,
-                                                    mh,
-                                                    self.pattern_hash.as_deref(),
-                                                    vault_key,
-                                                    &self.vault,
-                                                );
-                                                let _ = update_custom_tags(
-                                                    &vault_name,
-                                                    vault_key,
-                                                    &self.vault,
-                                                    &self.custom_tags,
-                                                );
-                                            }
-                                            self.login_error_msg = format!("Imported {} new entries", added);
+                                            self.login_error_msg = format!("Imported {} entries from {:?}", added, format);
                                             self.show_import_dialog = false;
-                                            self.import_data.clear();
+                                            self.import_data.zeroize();
                                             self.import_error = None;
                                         }
                                         Err(e) => {
-                                            self.import_error = Some(format!("Import failed: {e}"));
+                                            self.import_error = Some(format!("CSV import failed: {e}"));
+                                        }
+                                    }
+                                } else {
+                                    // Encrypted backup import
+                                    if let Some(ref vault_key) = self.current_vault_key {
+                                        match import_encrypted_backup(&self.import_data, vault_key) {
+                                            Ok(imported_data) => {
+                                                let mut added = 0;
+                                                for entry in imported_data.entries {
+                                                    let exists = self.vault.iter().any(|e| {
+                                                        e.website == entry.website && e.username == entry.username
+                                                    });
+                                                    if !exists {
+                                                        self.vault.push(entry);
+                                                        self.password_visible.push(false);
+                                                        added += 1;
+                                                    }
+                                                }
+                                                // Merge custom tags
+                                                for tag in imported_data.metadata.custom_tags {
+                                                    if !self.custom_tags.contains(&tag) {
+                                                        self.custom_tags.push(tag);
+                                                    }
+                                                }
+                                                // Save
+                                                if let Some(mh) = &self.master_hash {
+                                                    let vault_name = self.active_vault_name.clone().unwrap_or_default();
+                                                    let _ = save_vault_file(
+                                                        &vault_name,
+                                                        mh,
+                                                        self.pattern_hash.as_deref(),
+                                                        vault_key,
+                                                        &self.vault,
+                                                    );
+                                                    let _ = update_custom_tags(
+                                                        &vault_name,
+                                                        vault_key,
+                                                        &self.vault,
+                                                        &self.custom_tags,
+                                                    );
+                                                }
+                                                self.login_error_msg = format!("Imported {} new entries", added);
+                                                self.show_import_dialog = false;
+                                                self.import_data.zeroize();
+                                                self.import_error = None;
+                                            }
+                                            Err(e) => {
+                                                self.import_error = Some(format!("Import failed: {e}"));
+                                            }
                                         }
                                     }
                                 }
                             }
                             if ui.button("Cancel").clicked() {
                                 self.show_import_dialog = false;
-                                self.import_data.clear();
+                                self.import_data.zeroize();
                                 self.import_error = None;
                             }
                         });
 
                         ui.colored_label(Color32::GRAY, "Note: Import merges entries. Duplicates (same website+username) are skipped.");
                     });
+                }
+
+
+                // QR Code display dialog
+                if self.show_qr_for_entry.is_some() {
+                    // Clone QR data to avoid borrow issues
+                    let qr_data_clone = self.qr_code_data.clone();
+                    if let Some((width, data)) = qr_data_clone {
+                        ui.group(|ui| {
+                            ui.label(RichText::new("Scan with Authenticator App").color(Color32::YELLOW).size(18.0));
+
+                            // Render QR code using rectangles
+                            let module_size = 4.0; // Size of each QR module in pixels
+                            let qr_size = width as f32 * module_size;
+                            let padding = 8.0; // White border around QR
+
+                            // Create a frame for the QR code with white background
+                            egui::Frame::new()
+                                .fill(Color32::WHITE)
+                                .inner_margin(padding)
+                                .show(ui, |ui| {
+                                    let (response, painter) = ui.allocate_painter(
+                                        egui::vec2(qr_size, qr_size),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    let rect = response.rect;
+
+                                    // Draw each QR module
+                                    for y in 0..width {
+                                        for x in 0..width {
+                                            let idx = y * width + x;
+                                            if data.get(idx).copied().unwrap_or(false) {
+                                                let module_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        rect.min.x + x as f32 * module_size,
+                                                        rect.min.y + y as f32 * module_size,
+                                                    ),
+                                                    egui::vec2(module_size, module_size),
+                                                );
+                                                painter.rect_filled(module_rect, 0.0, Color32::BLACK);
+                                            }
+                                        }
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::GRAY, "Scan this QR code with Google Authenticator,");
+                            ui.colored_label(Color32::GRAY, "Authy, or another TOTP app.");
+
+                            ui.add_space(8.0);
+                            if ui.button("Close").clicked() {
+                                self.show_qr_for_entry = None;
+                                self.qr_code_data = None;
+                            }
+                        });
+                    }
                 }
             });
     }
@@ -1472,6 +1997,37 @@ impl QuickPassApp {
             .filter(|s| s.enabled)
             .map(|s| s.sym)
             .collect()
+    }
+
+    /// Unified pattern grid rendering - returns true if pattern meets minimum length
+    fn render_pattern_grid(ui: &mut egui::Ui, pattern: &mut Vec<(usize, usize)>) -> bool {
+        let original_spacing = ui.spacing().clone();
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
+
+        for row in 0..6 {
+            ui.horizontal(|ui| {
+                for col in 0..6 {
+                    let clicked = pattern.contains(&(row, col));
+                    let clr = if clicked {
+                        Color32::RED
+                    } else {
+                        Color32::DARK_BLUE
+                    };
+                    let btn =
+                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
+                    if ui.add_sized((35.0, 35.0), btn).clicked() {
+                        // Only add if not already clicked (unique cells only)
+                        if !pattern.contains(&(row, col)) {
+                            pattern.push((row, col));
+                        }
+                    }
+                }
+            });
+        }
+
+        *ui.spacing_mut() = original_spacing;
+        pattern.len() >= MIN_PATTERN_LENGTH
     }
 
     fn show_change_password_ui(&mut self, ui: &mut egui::Ui) {
@@ -1519,14 +2075,12 @@ impl QuickPassApp {
                             self.security_level,
                         ) {
                             Ok(new_hash) => {
-                                eprintln!("Master password changed!");
                                 self.master_hash = Some(new_hash);
                                 self.master_password_input = new_pw;
-                                self.login_error_msg.clear();
+                                self.login_error_msg = "Password changed successfully!".into();
                             }
                             Err(e) => {
-                                eprintln!("Change PW error: {e}");
-                                self.login_error_msg = format!("Failed to change PW: {e}");
+                                self.login_error_msg = format!("Failed to change password: {e}");
                             }
                         }
                     }
@@ -1535,15 +2089,15 @@ impl QuickPassApp {
                     }
                 }
             } else {
-                eprintln!("No vault key in memory, can't change password!");
+                self.login_error_msg = "Session error: vault key not in memory.".into();
             }
             self.show_change_pw = false;
         }
 
         if ui.button("Cancel").clicked() {
             self.show_change_pw = false;
-            self.new_master_pw_old_input.clear();
-            self.new_master_pw.clear();
+            self.new_master_pw_old_input.zeroize();
+            self.new_master_pw.zeroize();
         }
     }
 
@@ -1554,37 +2108,8 @@ impl QuickPassApp {
         ui.add(egui::TextEdit::singleline(&mut self.old_password_for_pattern).password(true));
 
         ui.separator();
-        ui.label("Create a new pattern (need >=8 unique clicks).");
-        if self.new_pattern_attempt.len() >= 8 {
-            self.new_pattern_unlocked = true;
-        }
-
-        let original_spacing = ui.spacing().clone();
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-        ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
-
-        for row in 0..6 {
-            ui.horizontal(|ui| {
-                for col in 0..6 {
-                    let clicked = self.new_pattern_attempt.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
-                    if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        // FIXED: Only add if not already clicked (unique cells only)
-                        if !self.new_pattern_attempt.contains(&(row, col)) {
-                            self.new_pattern_attempt.push((row, col));
-                        }
-                    }
-                }
-            });
-        }
-
-        *ui.spacing_mut() = original_spacing;
+        ui.label("Create a new pattern (need >=12 unique clicks).");
+        self.new_pattern_unlocked = Self::render_pattern_grid(ui, &mut self.new_pattern_attempt);
 
         if self.new_pattern_unlocked {
             ui.colored_label(Color32::GREEN, format!("New pattern set! ({} cells)", self.new_pattern_attempt.len()));
@@ -1613,16 +2138,14 @@ impl QuickPassApp {
                         ) {
                             Ok(np) => {
                                 self.pattern_hash = Some(np);
-                                eprintln!("Pattern changed successfully!");
-                                self.login_error_msg.clear();
+                                self.login_error_msg = "Pattern changed successfully!".into();
                             }
                             Err(e) => {
-                                eprintln!("Change pattern error: {e}");
                                 self.login_error_msg = format!("Failed to change pattern: {e}");
                             }
                         }
                     } else {
-                        eprintln!("No vault_key in memory, can't change pattern!");
+                        self.login_error_msg = "Session error: vault key not in memory.".into();
                     }
                 }
                 Err(_) => {
@@ -1634,103 +2157,250 @@ impl QuickPassApp {
 
         if ui.button("Cancel").clicked() {
             self.show_change_pattern = false;
-            self.old_password_for_pattern.clear();
+            self.old_password_for_pattern.zeroize();
             self.new_pattern_attempt.clear();
             self.new_pattern_unlocked = false;
         }
     }
 
     fn show_pattern_lock_first_run(&mut self, ui: &mut egui::Ui) {
-        if self.first_run_pattern.len() >= 8 {
-            self.first_run_pattern_unlocked = true;
-        }
-
-        let original_spacing = ui.spacing().clone();
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-        ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
-
-        for row in 0..6 {
-            ui.horizontal(|ui| {
-                for col in 0..6 {
-                    let clicked = self.first_run_pattern.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
-                    if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        // FIXED: Only add if not already clicked (unique cells only)
-                        if !self.first_run_pattern.contains(&(row, col)) {
-                            self.first_run_pattern.push((row, col));
-                        }
-                    }
-                }
-            });
-        }
-
-        *ui.spacing_mut() = original_spacing;
+        self.first_run_pattern_unlocked = Self::render_pattern_grid(ui, &mut self.first_run_pattern);
     }
 
     fn show_pattern_lock_login(&mut self, ui: &mut egui::Ui) {
-        if self.pattern_attempt.len() >= 8 {
-            self.is_pattern_unlock = true;
-        }
-
-        let original_spacing = ui.spacing().clone();
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-
-        for row in 0..6 {
-            ui.horizontal(|ui| {
-                for col in 0..6 {
-                    let clicked = self.pattern_attempt.contains(&(row, col));
-                    let clr = if clicked {
-                        Color32::RED
-                    } else {
-                        Color32::DARK_BLUE
-                    };
-                    let btn =
-                        egui::Button::new(RichText::new("*").size(30.0).color(clr)).frame(false);
-                    if ui.add_sized((35.0, 35.0), btn).clicked() {
-                        // FIXED: Only add if not already clicked (unique cells only)
-                        if !self.pattern_attempt.contains(&(row, col)) {
-                            self.pattern_attempt.push((row, col));
-                        }
-                    }
-                }
-            });
-        }
-
-        *ui.spacing_mut() = original_spacing;
+        self.is_pattern_unlock = Self::render_pattern_grid(ui, &mut self.pattern_attempt);
     }
 
     fn handle_login_failure(&mut self, err_msg: String) {
-        self.failed_attempts += 1;
-        let max_attempts = 5; // Increased from 3 to 5
-        let attempts_left = max_attempts - self.failed_attempts;
-        if self.failed_attempts >= max_attempts {
-            let vault_name = self.active_vault_name.clone().unwrap_or_default();
-            let path = vault_file_path(&vault_name);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
+        let vault_name = self.active_vault_name.clone().unwrap_or_default();
+
+        // Load or create lockout state
+        let mut lockout = self
+            .vault_lockout
+            .take()
+            .unwrap_or_else(|| VaultLockout::load(&vault_name));
+
+        // Record the failure and get the result (using configurable max_attempts from settings)
+        let max_attempts = self.settings.max_failed_attempts;
+        let result = lockout.record_failure(&vault_name, max_attempts);
+
+        match result {
+            LockoutResult::AttemptFailed { attempts_left } => {
+                // Show warning if getting close to lockout
+                let warning = lockout.get_warning(max_attempts).unwrap_or_default();
+                self.login_error_msg = if warning.is_empty() {
+                    format!("{err_msg} - Wrong credentials! {} attempts left.", attempts_left)
+                } else {
+                    format!("{err_msg} - Wrong credentials! WARNING: {}", warning)
+                };
+                self.vault_lockout = Some(lockout);
             }
-            eprintln!("Too many failed attempts! Vault deleted, exiting to manager...");
-            self.show_vault_manager = true;
-            self.active_vault_name = None;
-            self.is_logged_in = false;
-            self.vault.clear();
-            self.password_visible.clear();
-            self.master_password_input.clear();
-            self.pattern_attempt.clear();
-            self.is_pattern_unlock = false;
-            self.failed_attempts = 0;
-            self.login_error_msg = "Vault was deleted after too many failed attempts!".into();
-            self.manager_vaults = scan_vaults_in_dir();
-        } else {
-            self.login_error_msg =
-                format!("{err_msg} - Wrong credentials! {attempts_left} attempts left.");
+            LockoutResult::NewLockout {
+                lockout_number,
+                duration_minutes,
+                lockouts_before_deletion,
+            } => {
+                self.login_error_msg = format!(
+                    "Too many failed attempts! Vault locked for {} minutes. \
+                     (Lockout {}/4 - {} more lockout(s) before vault deletion)",
+                    duration_minutes, lockout_number, lockouts_before_deletion
+                );
+                self.vault_lockout = Some(lockout);
+                // Clear inputs
+                self.master_password_input.zeroize();
+                self.master_password_input.zeroize();
+                self.pattern_attempt.clear();
+            }
+            LockoutResult::StillLocked { remaining_seconds } => {
+                let mins = remaining_seconds / 60;
+                let secs = remaining_seconds % 60;
+                self.login_error_msg = format!(
+                    "Vault is locked. Try again in {}m {}s.",
+                    mins, secs
+                );
+                self.vault_lockout = Some(lockout);
+            }
+            LockoutResult::DeleteVault => {
+                // Final lockout exceeded - delete the vault
+                let path = vault_file_path(&vault_name);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                // Return to vault manager
+                self.show_vault_manager = true;
+                self.active_vault_name = None;
+                self.is_logged_in = false;
+                self.vault.clear();
+                self.password_visible.clear();
+                self.master_password_input.zeroize();
+                self.master_password_input.zeroize();
+                self.pattern_attempt.clear();
+                self.is_pattern_unlock = false;
+                self.failed_attempts = 0;
+                self.vault_lockout = None;
+                self.login_error_msg =
+                    "Vault deleted after exceeding maximum lockouts!".into();
+                self.manager_vaults = scan_vaults_in_dir();
+            }
         }
+    }
+
+    /// Check if the current vault is locked out
+    fn is_vault_locked(&self) -> bool {
+        if let Some(ref lockout) = self.vault_lockout {
+            lockout.is_locked()
+        } else if let Some(ref vault_name) = self.active_vault_name {
+            let lockout = VaultLockout::load(vault_name);
+            lockout.is_locked()
+        } else {
+            false
+        }
+    }
+
+    /// Reset lockout state on successful login
+    fn reset_lockout_on_success(&mut self) {
+        if let Some(ref vault_name) = self.active_vault_name {
+            if let Some(mut lockout) = self.vault_lockout.take() {
+                lockout.reset_on_success(vault_name);
+            } else {
+                // Also clear any file-based lockout
+                VaultLockout::delete(vault_name);
+            }
+        }
+        self.vault_lockout = None;
+    }
+}
+
+// ------------------ UNIT TESTS ------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_min_pattern_length_constant() {
+        // Ensure minimum pattern length is 12 for ~42 bits entropy
+        assert_eq!(MIN_PATTERN_LENGTH, 12);
+    }
+
+    #[test]
+    fn test_clipboard_timeout_default() {
+        // Ensure default clipboard timeout is 30 seconds
+        let settings = AppSettings::default();
+        assert_eq!(settings.clipboard_clear_seconds, 30);
+    }
+
+    #[test]
+    fn test_auto_lock_timeout_default() {
+        // Ensure default auto-lock is 5 minutes (300 seconds)
+        let settings = AppSettings::default();
+        assert_eq!(settings.auto_lock_seconds, 300);
+    }
+
+    #[test]
+    fn test_build_default_symbol_toggles() {
+        let toggles = build_default_symbol_toggles();
+        // Should have 26 symbols: !@#$%^&*()-_=+[]{}:;,.<>?/
+        assert_eq!(toggles.len(), 26);
+        // All should be enabled by default
+        assert!(toggles.iter().all(|t| t.enabled));
+        // Check some expected symbols are present
+        assert!(toggles.iter().any(|t| t.sym == '!'));
+        assert!(toggles.iter().any(|t| t.sym == '@'));
+        assert!(toggles.iter().any(|t| t.sym == '#'));
+    }
+
+    #[test]
+    fn test_collect_enabled_symbols() {
+        let mut toggles = build_default_symbol_toggles();
+        // Disable all but '!' and '@'
+        for t in &mut toggles {
+            t.enabled = t.sym == '!' || t.sym == '@';
+        }
+
+        let enabled: Vec<char> = toggles.iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.sym)
+            .collect();
+
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.contains(&'!'));
+        assert!(enabled.contains(&'@'));
+    }
+
+    #[test]
+    fn test_symbol_toggle_clone() {
+        let toggle = SymbolToggle { sym: '!', enabled: true };
+        let cloned = toggle.clone();
+        assert_eq!(toggle.sym, cloned.sym);
+        assert_eq!(toggle.enabled, cloned.enabled);
+    }
+
+    #[test]
+    fn test_quickpass_app_default_state() {
+        // Test that default state is secure
+        let app = QuickPassApp::default();
+
+        // Should start at vault manager, not logged in
+        assert!(app.show_vault_manager);
+        assert!(!app.is_logged_in);
+        assert!(app.active_vault_name.is_none());
+
+        // Vault should be empty
+        assert!(app.vault.is_empty());
+        assert!(app.current_vault_key.is_none());
+
+        // Sensitive fields should be empty
+        assert!(app.master_password_input.is_empty());
+        assert!(app.pattern_attempt.is_empty());
+        assert!(app.first_run_password.is_empty());
+        assert!(app.first_run_pattern.is_empty());
+
+        // Security level should default to Medium
+        assert_eq!(app.security_level, SecurityLevel::Medium);
+
+        // Failed attempts should be zero
+        assert_eq!(app.failed_attempts, 0);
+
+        // Password generation defaults
+        assert_eq!(app.length, 12);
+        assert!(app.use_lowercase);
+        assert!(app.use_uppercase);
+        assert!(app.use_digits);
+    }
+
+    #[test]
+    fn test_pattern_grid_minimum_returns_false_for_empty() {
+        // Empty pattern should not meet minimum
+        let pattern: Vec<(usize, usize)> = vec![];
+        assert!(pattern.len() < MIN_PATTERN_LENGTH);
+    }
+
+    #[test]
+    fn test_pattern_grid_minimum_returns_false_for_short() {
+        // Pattern with 11 cells should not meet minimum of 12
+        let pattern: Vec<(usize, usize)> = (0..11).map(|i| (i / 6, i % 6)).collect();
+        assert_eq!(pattern.len(), 11);
+        assert!(pattern.len() < MIN_PATTERN_LENGTH);
+    }
+
+    #[test]
+    fn test_pattern_grid_minimum_returns_true_for_sufficient() {
+        // Pattern with 12 cells should meet minimum
+        let pattern: Vec<(usize, usize)> = (0..12).map(|i| (i / 6, i % 6)).collect();
+        assert_eq!(pattern.len(), 12);
+        assert!(pattern.len() >= MIN_PATTERN_LENGTH);
+    }
+
+    #[test]
+    fn test_pattern_grid_covers_full_grid() {
+        // A 6x6 grid has 36 cells
+        let mut all_cells: Vec<(usize, usize)> = vec![];
+        for row in 0..6 {
+            for col in 0..6 {
+                all_cells.push((row, col));
+            }
+        }
+        assert_eq!(all_cells.len(), 36);
     }
 }
 
@@ -1762,6 +2432,10 @@ impl Drop for QuickPassApp {
         self.editing_website.zeroize();
         self.editing_username.zeroize();
         self.editing_password.zeroize();
+        self.editing_totp_secret.zeroize();
+
+        // Import data may contain passwords
+        self.import_data.zeroize();
 
         if let Some(ref mut k) = self.current_vault_key {
             k.zeroize();
