@@ -830,6 +830,30 @@ impl QuickPassApp {
         }
 
         ui.separator();
+
+        // Entropy Game Panel (for fun - NOT cryptographically necessary)
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.use_game_entropy, "Mix game data (for fun)");
+            ui.label("?").on_hover_text(
+                "FOR ENTERTAINMENT ONLY - does NOT improve security.\n\
+                System RNG is already cryptographically secure.\n\
+                This just adds your gameplay timing for fun."
+            );
+            if ui.button("Play Tic-Tac-Toe").clicked() {
+                self.entropy_game = Some(TicTacToe::new());
+                self.show_entropy_game = true;
+            }
+            if self.entropy_game.is_some() {
+                ui.colored_label(Color32::LIGHT_BLUE, "(game data available)");
+            }
+        });
+
+        // Show entropy game window if open
+        if self.show_entropy_game {
+            self.render_entropy_game_window(ui);
+        }
+
+        ui.separator();
         if ui.button("Create Vault").clicked() {
             // Validate master password
             if let Err(errors) = validate_master_password(&self.first_run_password) {
@@ -1378,111 +1402,7 @@ impl QuickPassApp {
 
                 // Entropy game window
                 if self.show_entropy_game {
-                    let mut close_game = false;
-                    let mut skip_game = false;
-                    let mut game_move: Option<(usize, usize)> = None;
-                    let mut reset_game = false;
-
-                    // Extract game state for UI display
-                    let game_state = self.entropy_game.as_ref().map(|g| {
-                        (g.status_message(), g.move_count, g.game_over,
-                         [[g.cell_symbol(0, 0), g.cell_symbol(0, 1), g.cell_symbol(0, 2)],
-                          [g.cell_symbol(1, 0), g.cell_symbol(1, 1), g.cell_symbol(1, 2)],
-                          [g.cell_symbol(2, 0), g.cell_symbol(2, 1), g.cell_symbol(2, 2)]],
-                         [[g.is_cell_clickable(0, 0), g.is_cell_clickable(0, 1), g.is_cell_clickable(0, 2)],
-                          [g.is_cell_clickable(1, 0), g.is_cell_clickable(1, 1), g.is_cell_clickable(1, 2)],
-                          [g.is_cell_clickable(2, 0), g.is_cell_clickable(2, 1), g.is_cell_clickable(2, 2)]])
-                    });
-
-                    egui::Window::new("Tic-Tac-Toe (Just for Fun!)")
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                        .show(ui.ctx(), |ui| {
-                            ui.colored_label(Color32::YELLOW, "Note: Entertainment only - passwords are already secure!");
-                            ui.label("Play for fun while QuickPass generates your password.");
-                            ui.add_space(10.0);
-
-                            if let Some((status, moves, game_over, symbols, clickable)) = &game_state {
-                                // Status message
-                                ui.label(RichText::new(*status).size(16.0));
-                                ui.add_space(5.0);
-
-                                // Draw the game board
-                                egui::Grid::new("tictactoe_grid")
-                                    .spacing([5.0, 5.0])
-                                    .show(ui, |ui| {
-                                        for row in 0..3 {
-                                            for col in 0..3 {
-                                                let symbol = symbols[row][col];
-                                                let is_clickable = clickable[row][col];
-
-                                                let button_color = if symbol == "X" {
-                                                    Color32::LIGHT_BLUE
-                                                } else if symbol == "O" {
-                                                    Color32::LIGHT_RED
-                                                } else {
-                                                    Color32::DARK_GRAY
-                                                };
-
-                                                let button = egui::Button::new(
-                                                    RichText::new(if symbol.is_empty() { " " } else { symbol })
-                                                        .size(32.0)
-                                                        .color(Color32::WHITE)
-                                                )
-                                                .fill(button_color)
-                                                .min_size(egui::vec2(60.0, 60.0));
-
-                                                let response = ui.add_enabled(is_clickable, button);
-                                                if response.clicked() && is_clickable {
-                                                    game_move = Some((row, col));
-                                                }
-                                            }
-                                            ui.end_row();
-                                        }
-                                    });
-
-                                ui.add_space(10.0);
-
-                                // Show entropy collected
-                                ui.label(format!("Moves: {} | Entropy bits collected", moves));
-
-                                ui.add_space(5.0);
-                                ui.horizontal(|ui| {
-                                    if *game_over {
-                                        if ui.button("Play Again").clicked() {
-                                            reset_game = true;
-                                        }
-                                    }
-                                    if ui.button("Done").clicked() {
-                                        close_game = true;
-                                    }
-                                    if ui.button("Skip (no entropy)").clicked() {
-                                        skip_game = true;
-                                        close_game = true;
-                                    }
-                                });
-                            }
-                        });
-
-                    // Apply game changes after UI
-                    if let Some((row, col)) = game_move {
-                        if let Some(ref mut game) = self.entropy_game {
-                            game.make_move(row, col);
-                        }
-                    }
-                    if reset_game {
-                        if let Some(ref mut game) = self.entropy_game {
-                            game.reset();
-                        }
-                    }
-                    if skip_game {
-                        self.entropy_game = None;
-                    }
-                    if close_game {
-                        self.show_entropy_game = false;
-                        self.use_game_entropy = self.entropy_game.is_some();
-                    }
+                    self.render_entropy_game_window(ui);
                 }
 
                 ui.add_space(5.0);
@@ -2547,6 +2467,115 @@ impl QuickPassApp {
 
         *ui.spacing_mut() = original_spacing;
         pattern.len() >= MIN_PATTERN_LENGTH
+    }
+
+    /// Render the Tic-Tac-Toe entropy game window
+    fn render_entropy_game_window(&mut self, ui: &mut egui::Ui) {
+        let mut close_game = false;
+        let mut skip_game = false;
+        let mut game_move: Option<(usize, usize)> = None;
+        let mut reset_game = false;
+
+        // Extract game state for UI display
+        let game_state = self.entropy_game.as_ref().map(|g| {
+            (g.status_message(), g.move_count, g.game_over,
+             [[g.cell_symbol(0, 0), g.cell_symbol(0, 1), g.cell_symbol(0, 2)],
+              [g.cell_symbol(1, 0), g.cell_symbol(1, 1), g.cell_symbol(1, 2)],
+              [g.cell_symbol(2, 0), g.cell_symbol(2, 1), g.cell_symbol(2, 2)]],
+             [[g.is_cell_clickable(0, 0), g.is_cell_clickable(0, 1), g.is_cell_clickable(0, 2)],
+              [g.is_cell_clickable(1, 0), g.is_cell_clickable(1, 1), g.is_cell_clickable(1, 2)],
+              [g.is_cell_clickable(2, 0), g.is_cell_clickable(2, 1), g.is_cell_clickable(2, 2)]])
+        });
+
+        egui::Window::new("Tic-Tac-Toe (Just for Fun!)")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.colored_label(Color32::YELLOW, "Note: Entertainment only - passwords are already secure!");
+                ui.label("Play for fun while QuickPass works.");
+                ui.add_space(10.0);
+
+                if let Some((status, moves, game_over, symbols, clickable)) = &game_state {
+                    // Status message
+                    ui.label(RichText::new(*status).size(16.0));
+                    ui.add_space(5.0);
+
+                    // Draw the game board
+                    egui::Grid::new("tictactoe_grid")
+                        .spacing([5.0, 5.0])
+                        .show(ui, |ui| {
+                            for row in 0..3 {
+                                for col in 0..3 {
+                                    let symbol = symbols[row][col];
+                                    let is_clickable = clickable[row][col];
+
+                                    let button_color = if symbol == "X" {
+                                        Color32::LIGHT_BLUE
+                                    } else if symbol == "O" {
+                                        Color32::LIGHT_RED
+                                    } else {
+                                        Color32::DARK_GRAY
+                                    };
+
+                                    let button = egui::Button::new(
+                                        RichText::new(if symbol.is_empty() { " " } else { symbol })
+                                            .size(32.0)
+                                            .color(Color32::WHITE)
+                                    )
+                                    .fill(button_color)
+                                    .min_size(egui::vec2(60.0, 60.0));
+
+                                    let response = ui.add_enabled(is_clickable, button);
+                                    if response.clicked() && is_clickable {
+                                        game_move = Some((row, col));
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(10.0);
+
+                    // Show entropy collected
+                    ui.label(format!("Moves: {} | Entropy bits collected", moves));
+
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        if *game_over {
+                            if ui.button("Play Again").clicked() {
+                                reset_game = true;
+                            }
+                        }
+                        if ui.button("Done").clicked() {
+                            close_game = true;
+                        }
+                        if ui.button("Skip (no entropy)").clicked() {
+                            skip_game = true;
+                            close_game = true;
+                        }
+                    });
+                }
+            });
+
+        // Apply game changes after UI
+        if let Some((row, col)) = game_move {
+            if let Some(ref mut game) = self.entropy_game {
+                game.make_move(row, col);
+            }
+        }
+        if reset_game {
+            if let Some(ref mut game) = self.entropy_game {
+                game.reset();
+            }
+        }
+        if skip_game {
+            self.entropy_game = None;
+        }
+        if close_game {
+            self.show_entropy_game = false;
+            self.use_game_entropy = self.entropy_game.is_some();
+        }
     }
 
     fn show_change_password_ui(&mut self, ui: &mut egui::Ui) {
