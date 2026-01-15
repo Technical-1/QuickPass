@@ -7,8 +7,23 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use sysinfo::Disks;
+
+/// Maximum length for sanitized vault name in filename
+const MAX_VAULT_NAME_LEN: usize = 50;
+/// Maximum total filename length
+const MAX_FILENAME_LEN: usize = 255;
+/// Minimum free space required for export (1 MB)
+const MIN_FREE_SPACE: u64 = 1_048_576;
+
+/// System directories that should never be export targets
+const BLOCKED_PATHS: &[&str] = &[
+    "/", "/etc", "/usr", "/bin", "/sbin", "/var", "/tmp",
+    "/System", "/Library", "/Applications", "/private",
+    "C:\\", "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+    "C:\\Users\\Public", "C:\\ProgramData",
+];
 
 /// Represents a detected USB/removable drive
 #[derive(Clone, Debug)]
@@ -70,6 +85,85 @@ pub fn detect_usb_devices() -> Vec<USBDevice> {
         .collect()
 }
 
+/// Check if a path is a blocked system directory
+fn is_blocked_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    for blocked in BLOCKED_PATHS {
+        // Check if path IS the blocked path or is directly under it with nothing else
+        if path_str == *blocked || (path_str.starts_with(blocked) && path_str.len() == blocked.len()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate USB device is safe for export
+pub fn validate_export_device(device: &USBDevice) -> Result<(), String> {
+    // Check mount point exists
+    if !device.mount_point.exists() {
+        return Err("Mount point does not exist".into());
+    }
+
+    // Check it's not a system directory
+    if is_blocked_path(&device.mount_point) {
+        return Err("Cannot export to system directory".into());
+    }
+
+    // Check minimum free space
+    if device.available_bytes < MIN_FREE_SPACE {
+        return Err(format!(
+            "Insufficient space: need at least 1 MB, have {} bytes",
+            device.available_bytes
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate and create safe export path
+fn create_safe_export_path(mount_point: &Path, vault_name: &str) -> Result<(PathBuf, String), Box<dyn Error>> {
+    // Sanitize vault name: only alphanumeric and underscore, limited length
+    let safe_name: String = vault_name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .take(MAX_VAULT_NAME_LEN)
+        .collect();
+
+    // Use a fallback if name is empty after sanitization
+    let safe_name = if safe_name.is_empty() {
+        "vault".to_string()
+    } else {
+        safe_name
+    };
+
+    // Generate filename with timestamp
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = format!(".quickpass_{}_{}.enc", safe_name, timestamp);
+
+    // Validate filename length
+    if filename.len() > MAX_FILENAME_LEN {
+        return Err("Generated filename too long".into());
+    }
+
+    // Create and validate export path
+    let export_path = mount_point.join(&filename);
+
+    // Security check: ensure path doesn't escape mount point
+    // (e.g., via .. or symlinks)
+    let canonical_mount = mount_point.canonicalize().unwrap_or_else(|_| mount_point.to_path_buf());
+    if let Ok(canonical_export) = export_path.canonicalize() {
+        if !canonical_export.starts_with(&canonical_mount) {
+            return Err("Invalid export path - possible path traversal".into());
+        }
+    }
+    // For new files, just verify parent is the mount point
+    if export_path.parent() != Some(mount_point) {
+        return Err("Export path must be directly in mount point".into());
+    }
+
+    Ok((export_path, filename))
+}
+
 /// Export encrypted vault to a USB device
 pub fn export_to_usb(
     device: &USBDevice,
@@ -78,6 +172,12 @@ pub fn export_to_usb(
     entries: &[crate::vault::VaultEntry],
     custom_tags: &[String],
 ) -> Result<PathBuf, Box<dyn Error>> {
+    // Validate device is safe for export
+    validate_export_device(device).map_err(|e| -> Box<dyn Error> { e.into() })?;
+
+    // Create safe export path with validation
+    let (export_path, _filename) = create_safe_export_path(&device.mount_point, vault_name)?;
+
     // Get encrypted backup data using existing function
     let backup_json = crate::vault::export_encrypted_backup(vault_name, vault_key, entries, custom_tags)?;
 
@@ -99,12 +199,6 @@ pub fn export_to_usb(
         ciphertext: ciphertext.to_string(),
         checksum,
     };
-
-    // Generate filename
-    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-    let safe_name = vault_name.replace(|c: char| !c.is_alphanumeric(), "_");
-    let filename = format!(".quickpass_{}_{}.enc", safe_name, timestamp);
-    let export_path = device.mount_point.join(&filename);
 
     // Write to USB
     let json = serde_json::to_string_pretty(&usb_export)?;

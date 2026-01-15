@@ -23,6 +23,11 @@ use crate::vault::{
 /// Minimum pattern length for security (~42 bits entropy with 12 cells)
 const MIN_PATTERN_LENGTH: usize = 12;
 
+/// Maximum custom field name length
+const MAX_CUSTOM_FIELD_NAME_LEN: usize = 100;
+/// Maximum custom field value length (10 KB)
+const MAX_CUSTOM_FIELD_VALUE_LEN: usize = 10_000;
+
 // Note: Clipboard and auto-lock timeouts are now configurable via AppSettings
 
 #[derive(Clone)]
@@ -830,7 +835,7 @@ impl QuickPassApp {
             if let Err(errors) = validate_master_password(&self.first_run_password) {
                 self.login_error_msg = format!("Password: {}", errors.join(", "));
             } else if !self.first_run_pattern_unlocked {
-                self.login_error_msg = "Please create a pattern (8+ unique clicks)!".into();
+                self.login_error_msg = format!("Please create a pattern ({}+ unique clicks)!", MIN_PATTERN_LENGTH);
             } else {
                 let pattern_hash = pattern_to_string(&self.first_run_pattern);
                 match create_new_vault_file(
@@ -1353,17 +1358,21 @@ impl QuickPassApp {
                     }
                 });
 
-                // Entropy Game Panel (optional fun way to add randomness)
+                // Entropy Game Panel (for fun - NOT cryptographically necessary)
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.use_game_entropy, "Use game entropy");
-                    ui.label("|").on_hover_text("Playing a game collects timing data to add extra randomness to passwords");
+                    ui.checkbox(&mut self.use_game_entropy, "Mix game data (for fun)");
+                    ui.label("?").on_hover_text(
+                        "FOR ENTERTAINMENT ONLY - does NOT improve security.\n\
+                        System RNG is already cryptographically secure.\n\
+                        This just adds your gameplay timing for fun."
+                    );
                     if ui.button("Play Tic-Tac-Toe").clicked() {
                         self.entropy_game = Some(TicTacToe::new());
                         self.show_entropy_game = true;
                     }
                     if self.entropy_game.is_some() {
-                        ui.colored_label(Color32::GREEN, "Entropy collected!");
+                        ui.colored_label(Color32::LIGHT_BLUE, "(game data available)");
                     }
                 });
 
@@ -1385,12 +1394,13 @@ impl QuickPassApp {
                           [g.is_cell_clickable(2, 0), g.is_cell_clickable(2, 1), g.is_cell_clickable(2, 2)]])
                     });
 
-                    egui::Window::new("Tic-Tac-Toe - Collect Entropy")
+                    egui::Window::new("Tic-Tac-Toe (Just for Fun!)")
                         .collapsible(false)
                         .resizable(false)
                         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                         .show(ui.ctx(), |ui| {
-                            ui.label("Play to collect random entropy for password generation!");
+                            ui.colored_label(Color32::YELLOW, "Note: Entertainment only - passwords are already secure!");
+                            ui.label("Play for fun while QuickPass generates your password.");
                             ui.add_space(10.0);
 
                             if let Some((status, moves, game_over, symbols, clickable)) = &game_state {
@@ -1727,7 +1737,8 @@ impl QuickPassApp {
                                             ui.label("New field:");
                                             ui.add(egui::TextEdit::singleline(&mut self.new_custom_field_name)
                                                 .hint_text("Name")
-                                                .desired_width(100.0));
+                                                .desired_width(100.0)
+                                                .char_limit(MAX_CUSTOM_FIELD_NAME_LEN));
 
                                             egui::ComboBox::from_id_salt("custom_field_type")
                                                 .selected_text(format!("{:?}", self.new_custom_field_type))
@@ -1740,23 +1751,44 @@ impl QuickPassApp {
                                                 });
                                         });
 
+                                        // Character count for name
+                                        ui.horizontal(|ui| {
+                                            ui.small(format!("{}/{} chars", self.new_custom_field_name.len(), MAX_CUSTOM_FIELD_NAME_LEN));
+                                        });
+
                                         // Value input (multiline for Notes type)
                                         if matches!(self.new_custom_field_type, CustomFieldType::Notes) {
                                             ui.add(egui::TextEdit::multiline(&mut self.new_custom_field_value)
                                                 .hint_text("Value")
                                                 .desired_rows(3)
-                                                .desired_width(f32::INFINITY));
+                                                .desired_width(f32::INFINITY)
+                                                .char_limit(MAX_CUSTOM_FIELD_VALUE_LEN));
                                         } else {
                                             ui.add(egui::TextEdit::singleline(&mut self.new_custom_field_value)
                                                 .hint_text("Value")
                                                 .desired_width(f32::INFINITY)
-                                                .password(matches!(self.new_custom_field_type, CustomFieldType::Password)));
+                                                .password(matches!(self.new_custom_field_type, CustomFieldType::Password))
+                                                .char_limit(MAX_CUSTOM_FIELD_VALUE_LEN));
                                         }
 
+                                        // Character count for value
+                                        ui.horizontal(|ui| {
+                                            let value_len = self.new_custom_field_value.len();
+                                            let color = if value_len > MAX_CUSTOM_FIELD_VALUE_LEN * 9 / 10 {
+                                                Color32::YELLOW
+                                            } else {
+                                                Color32::GRAY
+                                            };
+                                            ui.colored_label(color, format!("{}/{} chars", value_len, MAX_CUSTOM_FIELD_VALUE_LEN));
+                                        });
+
                                         if ui.button("Add Field").clicked() && !self.new_custom_field_name.is_empty() {
+                                            // Enforce limits (in case char_limit didn't work)
+                                            let name = self.new_custom_field_name.chars().take(MAX_CUSTOM_FIELD_NAME_LEN).collect();
+                                            let value = self.new_custom_field_value.chars().take(MAX_CUSTOM_FIELD_VALUE_LEN).collect();
                                             self.editing_custom_fields.push(CustomField::new(
-                                                self.new_custom_field_name.clone(),
-                                                self.new_custom_field_value.clone(),
+                                                name,
+                                                value,
                                                 self.new_custom_field_type.clone(),
                                             ));
                                             self.custom_field_visible.push(false);
