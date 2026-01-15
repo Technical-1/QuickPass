@@ -91,8 +91,7 @@ pub fn estimate_entropy(pwd: &str) -> f64 {
     let length = pwd.chars().count() as f64;
     let space = char_space as f64;
     // entropy in bits = length * log2(space)
-    let approx_bits = length * space.log2();
-    approx_bits
+    length * space.log2()
 }
 
 pub fn generate_password(

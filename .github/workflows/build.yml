@@ -6,7 +6,7 @@ on:
       - "v*.*.*"
 permissions:
   contents: write
-  
+
 
 jobs:
   # ------------------------------------------------
@@ -50,10 +50,10 @@ jobs:
           overwrite: true
 
   # ------------------------------------------------
-  # (2) Build & Notarize macOS .dmg
+  # (2) Build macOS (unsigned)
   # ------------------------------------------------
-  build-macos-dmg:
-    name: "Build, .app, Notarize macOS"
+  build-macos:
+    name: "Build (macOS)"
     runs-on: macos-latest
 
     steps:
@@ -65,110 +65,21 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cargo build
+      - name: Cargo build (release)
         run: cargo build --release
 
-      - name: Install Code Signing Certificate
-        run: |
-          echo "$APPLE_CERT" | base64 --decode > signing.p12
-          security create-keychain -p "" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
-
-          # Download & import Apple WWDR intermediate certificate
-          curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
-          security import AppleWWDRCAG3.cer -k build.keychain
-
-          security import signing.p12 -k build.keychain -P "$APPLE_CERT_PASS" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
-        env:
-          APPLE_CERT: ${{ secrets.APPLE_CERT }}
-          APPLE_CERT_PASS: ${{ secrets.APPLE_CERT_PASS }}
-
-      - name: Create .app bundle
-        run: |
-          mkdir -p QuickPass.app/Contents/MacOS
-          cp target/release/QuickPass QuickPass.app/Contents/MacOS/
-
-          cp .github/workflows/Info.plist QuickPass.app/Contents/Info.plist
-
-          mkdir -p QuickPass.app/Contents/Resources
-          cp .github/workflows/icon.icns QuickPass.app/Contents/Resources/icon.icns
-
-      - name: Code Sign .app
-        run: |
-          codesign --force --options runtime \
-            --sign "Developer ID Application: Jacob Kanfer (M7SN262HK4)" \
-            QuickPass.app
-
-      - name: Debug Signed .app
-        run: |
-          codesign -dv --verbose=4 QuickPass.app
-          spctl -a -vvv QuickPass.app || true
-
-      - name: Create .dmg
-        run: |
-          mv QuickPass.app target/release/
-          cd target/release
-          mkdir QuickPassDmgContent
-          mv QuickPass.app QuickPassDmgContent/
-          hdiutil create QuickPass.dmg \
-            -volname "QuickPass" \
-            -srcfolder "QuickPassDmgContent" \
-            -fs HFS+ \
-            -ov
-
-      - name: Notarize .dmg
-        if: env.APPLE_APP_SPECIFIC_PASSWORD
-        run: |
-          cd target/release
-          xcrun notarytool submit QuickPass.dmg \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait 2>&1 | tee notarytool-submit.txt
-
-          echo "=== Submission raw output: ==="
-          cat notarytool-submit.txt
-
-          SUBMISSION_ID=$(grep '^  id:' notarytool-submit.txt | head -n1 | sed 's/.*id: //')
-          echo "Extracted SUBMISSION_ID=${SUBMISSION_ID}"
-
-          STATUS=$(grep 'status:' notarytool-submit.txt | tail -n1 | sed 's/.*status: //')
-          echo "Extracted Notary Status=$STATUS"
-
-          if [ "$STATUS" = "Accepted" ]; then
-            echo "Stapling .dmg..."
-            xcrun stapler staple QuickPass.dmg
-          else
-            echo "Notarization invalid. Fetching logs with SUBMISSION_ID=${SUBMISSION_ID}..."
-            xcrun notarytool log "$SUBMISSION_ID" \
-              --apple-id "$APPLE_ID" \
-              --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-              2>&1 | tee notarytool-log.txt
-
-            echo "=== Detailed Notary Log: ==="
-            cat notarytool-log.txt
-            exit 1
-          fi
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-
-      - name: Upload notarized .dmg
+      - name: Upload artifact (macOS)
         uses: actions/upload-artifact@v4
         with:
-          name: QuickPass-macOS-dmg
-          path: target/release/QuickPass.dmg
+          name: QuickPass-macOS
+          path: target/release/QuickPass
           overwrite: true
 
-   # ------------------------------------------------
-  # 3) Release job
+  # ------------------------------------------------
+  # (3) Release job
   # ------------------------------------------------
   release:
-    needs: [build-windows-linux, build-macos-dmg]
+    needs: [build-windows-linux, build-macos]
     runs-on: ubuntu-latest
 
     steps:
@@ -184,10 +95,10 @@ jobs:
           name: QuickPass-Linux
           path: ./dist
 
-      - name: Download mac dmg
+      - name: Download macOS
         uses: actions/download-artifact@v4
         with:
-          name: QuickPass-macOS-dmg
+          name: QuickPass-macOS
           path: ./dist
 
       - name: Create Release
@@ -221,12 +132,12 @@ jobs:
           asset_name: QuickPass-Linux
           asset_content_type: application/octet-stream
 
-      - name: Upload mac dmg
+      - name: Upload macOS
         uses: actions/upload-release-asset@v1
         env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/QuickPass.dmg
-          asset_name: QuickPass-macOS.dmg
+          asset_path: ./dist/QuickPass
+          asset_name: QuickPass-macOS
           asset_content_type: application/octet-stream

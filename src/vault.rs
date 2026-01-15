@@ -18,6 +18,9 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use crate::manager::vault_file_path;
 use crate::security::{SecurityLevel, argon2_for_level, generate_random_salt};
 
+/// Result type for vault key loading: (master_hash, pattern_hash, vault_key)
+pub type VaultKeyResult = Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>>;
+
 /// Each vault entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VaultEntry {
@@ -351,7 +354,7 @@ pub fn load_vault_key_only(
     master_password: &str,
     pattern: Option<&[u8]>,
     level: SecurityLevel,
-) -> Result<(String, Option<String>, Vec<u8>), Box<dyn StdError>> {
+) -> VaultKeyResult {
     let ef = read_encrypted_vault_file(vault_file_path(vault_name))?;
     let argon2 = argon2_for_level(level);
 
@@ -636,26 +639,6 @@ pub fn create_entry_with_timestamp(
         created_at: Some(now.clone()),
         modified_at: Some(now),
         totp_secret: None,
-    }
-}
-
-/// Create a new VaultEntry with TOTP secret
-pub fn create_entry_with_totp(
-    website: String,
-    username: String,
-    password: String,
-    tags: Vec<String>,
-    totp_secret: Option<String>,
-) -> VaultEntry {
-    let now = current_utc_timestamp_string();
-    VaultEntry {
-        website,
-        username,
-        password,
-        tags,
-        created_at: Some(now.clone()),
-        modified_at: Some(now),
-        totp_secret,
     }
 }
 
@@ -1630,20 +1613,5 @@ bank.com,user2,pass2,Finance"#;
     fn test_generate_totp_code_invalid_secret() {
         let result = generate_totp_code("invalid!secret");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_entry_with_totp() {
-        let secret = generate_totp_secret();
-        let entry = create_entry_with_totp(
-            "example.com".to_string(),
-            "user".to_string(),
-            "pass".to_string(),
-            vec!["Work".to_string()],
-            Some(secret.clone()),
-        );
-
-        assert_eq!(entry.website, "example.com");
-        assert_eq!(entry.totp_secret, Some(secret));
     }
 }

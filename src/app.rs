@@ -366,21 +366,19 @@ impl App for QuickPassApp {
                 // Before calling show_login_ui, read the EncryptedVaultFile to retrieve security_level
                 if file_exists {
                     if let Ok(ef) =
-                        crate::vault::read_encrypted_vault_file(vault_file_path(&vault_name))
+                        crate::vault::read_encrypted_vault_file(vault_file_path(vault_name))
                     {
                         // We override our current self.security_level with the stored one
                         self.security_level = ef.security_level;
                     }
                 }
                 self.show_login_ui(ui);
+            } else if self.show_change_pw {
+                self.show_change_password_ui(ui);
+            } else if self.show_change_pattern {
+                self.show_change_pattern_ui(ui);
             } else {
-                if self.show_change_pw {
-                    self.show_change_password_ui(ui);
-                } else if self.show_change_pattern {
-                    self.show_change_pattern_ui(ui);
-                } else {
-                    self.show_main_ui(ui);
-                }
+                self.show_main_ui(ui);
             }
         });
 
@@ -627,7 +625,7 @@ impl QuickPassApp {
                 ui.label("This action cannot be undone!");
                 ui.horizontal(|ui| {
                     if ui.button("Yes, Delete").clicked() {
-                        let path = vault_file_path(&vault_to_delete);
+                        let path = vault_file_path(vault_to_delete);
                         let _ = std::fs::remove_file(path);
                         self.manager_vaults = scan_vaults_in_dir();
                         self.pending_delete_vault = None;
@@ -765,7 +763,7 @@ impl QuickPassApp {
 
         ui.separator();
         ui.label("Create a Pattern (6x6 grid, need >=12 unique clicks):");
-        self.show_pattern_lock_first_run(ui);
+        self.first_run_pattern_unlocked = Self::render_pattern_grid(ui, &mut self.first_run_pattern);
 
         if self.first_run_pattern_unlocked {
             ui.colored_label(Color32::GREEN, format!("Pattern set! ({} cells)", self.first_run_pattern.len()));
@@ -974,7 +972,7 @@ impl QuickPassApp {
                 .size(20.0)
                 .color(Color32::GRAY),
         );
-        self.show_pattern_lock_login(ui);
+        self.is_pattern_unlock = Self::render_pattern_grid(ui, &mut self.pattern_attempt);
 
         if self.is_pattern_unlock && !is_locked {
             if ui.button("Enter with Pattern").clicked() {
@@ -2161,14 +2159,6 @@ impl QuickPassApp {
             self.new_pattern_attempt.clear();
             self.new_pattern_unlocked = false;
         }
-    }
-
-    fn show_pattern_lock_first_run(&mut self, ui: &mut egui::Ui) {
-        self.first_run_pattern_unlocked = Self::render_pattern_grid(ui, &mut self.first_run_pattern);
-    }
-
-    fn show_pattern_lock_login(&mut self, ui: &mut egui::Ui) {
-        self.is_pattern_unlock = Self::render_pattern_grid(ui, &mut self.pattern_attempt);
     }
 
     fn handle_login_failure(&mut self, err_msg: String) {

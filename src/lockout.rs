@@ -17,7 +17,7 @@ use crate::manager::vault_file_path;
 const MAX_LOCKOUTS: u32 = 3;
 
 /// Lockout state for a vault
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VaultLockout {
     /// ISO 8601 timestamp when lockout expires (None if not locked)
     pub locked_until: Option<String>,
@@ -27,17 +27,6 @@ pub struct VaultLockout {
     pub lockout_count: u32,
     /// Timestamp of last failed attempt
     pub last_attempt: Option<String>,
-}
-
-impl Default for VaultLockout {
-    fn default() -> Self {
-        Self {
-            locked_until: None,
-            failed_attempts: 0,
-            lockout_count: 0,
-            last_attempt: None,
-        }
-    }
 }
 
 impl VaultLockout {
