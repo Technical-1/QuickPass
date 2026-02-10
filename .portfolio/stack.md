@@ -131,7 +131,7 @@ All levels exceed OWASP minimum recommendations (19 MiB, 2 iterations).
 ## Why I Made These Choices
 
 ### Rust over Electron/JavaScript
-Password managers written in Electron have historically had security issues due to JavaScript's memory model. Rust's ownership system ensures sensitive data can be properly managed and cleared.
+Password managers written in Electron have historically had security issues due to JavaScript's memory model. Rust's ownership system ensures sensitive data can be properly managed and cleared. A [Tauri v2 + React rewrite](https://github.com/Technical-1/QuickPass-v2) exists for users who prefer a modern web UI, but this pure-Rust version has the strongest memory safety guarantees.
 
 ### egui over Qt/GTK
 Native GUI toolkits require system dependencies and have inconsistent APIs across platforms. egui provides a consistent, dependency-free experience with acceptable performance for a utility application.

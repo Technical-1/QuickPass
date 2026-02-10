@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@700;800;900&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    .og-card {
+      width: 1200px;
+      height: 630px;
+      background: #0a0a0f;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 60px;
+    }
+
+    /* Subtle grid background */
+    .og-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+      background-size: 40px 40px;
+      z-index: 0;
+    }
+
+    /* Glow orb top-right */
+    .glow-1 {
+      position: absolute;
+      top: -120px;
+      right: -80px;
+      width: 400px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(56, 189, 248, 0.08) 0%, transparent 70%);
+      z-index: 0;
+    }
+
+    /* Glow orb bottom-left */
+    .glow-2 {
+      position: absolute;
+      bottom: -100px;
+      left: -60px;
+      width: 350px;
+      height: 350px;
+      background: radial-gradient(circle, rgba(34, 197, 94, 0.06) 0%, transparent 70%);
+      z-index: 0;
+    }
+
+    /* Scrolling hash background */
+    .hash-layer {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      overflow: hidden;
+      opacity: 0.06;
+    }
+
+    .hash-column {
+      position: absolute;
+      top: -20px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 16px;
+      color: #38bdf8;
+      white-space: pre;
+      letter-spacing: 0.5px;
+    }
+
+    .hash-column.green { color: #22c55e; }
+    .hash-column.dim { color: #64748b; opacity: 0.7; }
+
+    /* Main content */
+    .content {
+      position: relative;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 20px;
+    }
+
+    /* Lock icon */
+    .lock-icon {
+      width: 64px;
+      height: 64px;
+      margin-bottom: 4px;
+    }
+
+    .lock-icon svg {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Title */
+    .title {
+      font-family: 'Inter', sans-serif;
+      font-weight: 900;
+      font-size: 100px;
+      color: #f1f5f9;
+      letter-spacing: -3px;
+      line-height: 1;
+      text-shadow: 0 0 60px rgba(56, 189, 248, 0.15);
+    }
+
+    /* Tagline */
+    .tagline {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 400;
+      font-size: 22px;
+      color: #94a3b8;
+      letter-spacing: 0.5px;
+      margin-top: 4px;
+    }
+
+    .tagline .accent {
+      color: #38bdf8;
+    }
+
+    /* Feature pills */
+    .features {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      font-weight: 500;
+      color: #cbd5e1;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 20px;
+      padding: 8px 18px;
+      letter-spacing: 0.3px;
+    }
+
+    .pill .icon {
+      margin-right: 6px;
+    }
+
+    /* Bottom URL */
+    .url {
+      position: absolute;
+      bottom: 32px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 14px;
+      color: #475569;
+      letter-spacing: 1px;
+      z-index: 10;
+    }
+
+    /* Horizontal scan line accent */
+    .scan-line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent 0%, rgba(56, 189, 248, 0.12) 30%, rgba(56, 189, 248, 0.12) 70%, transparent 100%);
+      z-index: 2;
+    }
+    .scan-line.top { top: 140px; }
+    .scan-line.bottom { bottom: 140px; }
+
+    /* Corner accents */
+    .corner {
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      z-index: 10;
+      opacity: 0.2;
+    }
+    .corner.tl { top: 20px; left: 20px; border-top: 2px solid #38bdf8; border-left: 2px solid #38bdf8; }
+    .corner.tr { top: 20px; right: 20px; border-top: 2px solid #38bdf8; border-right: 2px solid #38bdf8; }
+    .corner.bl { bottom: 20px; left: 20px; border-bottom: 2px solid #38bdf8; border-left: 2px solid #38bdf8; }
+    .corner.br { bottom: 20px; right: 20px; border-bottom: 2px solid #38bdf8; border-right: 2px solid #38bdf8; }
+  </style>
+</head>
+<body>
+  <div class="og-card">
+    <!-- Ambient glows -->
+    <div class="glow-1"></div>
+    <div class="glow-2"></div>
+
+    <!-- Scan lines -->
+    <div class="scan-line top"></div>
+    <div class="scan-line bottom"></div>
+
+    <!-- Corner brackets -->
+    <div class="corner tl"></div>
+    <div class="corner tr"></div>
+    <div class="corner bl"></div>
+    <div class="corner br"></div>
+
+    <!-- Hash/security background text -->
+    <div class="hash-layer">
+      <div class="hash-column" style="left: 20px; top: -10px;">a3f8c9d2e1b7<br>4a6f2c8d9e1b<br>7b3e5a1f8c9d<br>02d4f6a8c0e2<br>9e1b3d5f7a9c<br>$2b$12$LJk3x<br>f8a2c4e6d0b1<br>sha256:9f86d0<br>1d3e5f7a9b0c<br>argon2id$v=19<br>8c0e2a4f6b1d<br>aes-256-gcm::<br>3f7a9c1e5b0d<br>$m=65536,t=4<br>7b9d1f3a5c0e<br>e2a4c6f8b0d1<br>nonce:4a6c8e<br>5f1a3c7e9b0d<br>salt:7d2f4a6<br>kdf:argon2id<br>b8e0a2c4f6d1<br>hmac-sha256::<br>9c1e3a5f7b0d<br>$p=4$r8kL2mN<br>vault_key:32b<br>6a8c0e2b4d1f<br>encrypted:aes<br>3e5a7c9f1b0d<br>zeroize::drop<br>a4f6c8e0b2d1<br>7f9a1c3e5b0d<br>hash:sha256::<br>2c4e6a8f0b1d<br>pepper:random<br>8e0a2c4f6b1d<br>iv:12bytes::<br>5a7c9e1f3b0d<br>gcm:tag:16b:<br>d1f3a5c7e9b0<br>key_wrap:aes:</div>
+
+      <div class="hash-column green" style="left: 180px; top: -30px;">b7e1a3f5c9d2<br>6c8e0a2f4b1d<br>9d1f3a5c7e0b<br>hash_password<br>4a6c8e0b2d1f<br>verify_argon2<br>f5a7c9e1b3d0<br>$argon2id$v=<br>2e4a6c8f0b1d<br>19$m=47104,t<br>7c9e1a3f5b0d<br>=3,p=4$salt$<br>0b2d4f6a8c1e<br>derived_key::<br>5a7c9e1f3b0d<br>aead::encrypt<br>8e0a2c4f6b1d<br>rand::thread_<br>3f5a7c9e1b0d<br>rng().gen::<()<br>c8e0a2b4d6f1<br>vault.encrypt<br>1d3f5a7c9e0b<br>session.drop(<br>6a8c0e2b4f1d<br>zeroize_flat(<br>9e1b3d5f7a0c<br>master_hash::<br>4c6a8e0f2b1d<br>pattern_hash:<br>7f9a1c3e5b0d<br>encrypt_vault<br>2b4d6a8c0e1f<br>decrypt_vault<br>5e7a9c1f3b0d<br>load_vault:ok<br>8c0e2a4f6b1d<br>save_atomic::<br>1f3a5c7e9b0d<br>write_tmp_ren<br>4a6c8e0b2d1f</div>
+
+      <div class="hash-column dim" style="left: 340px; top: -5px;">c9d2e1b7a3f8<br>8d9e1b4a6f2c<br>1f8c9d7b3e5a<br>a8c0e202d4f6<br>d5f7a9c9e1b3<br>x$2b$12$LJk3<br>e6d0b1f8a2c4<br>86d0sha256:9f<br>9b0c1d3e5f7a<br>v=19argon2id$<br>f6b1d8c0e2a4<br>gcm::aes-256-<br>5c0e3f7a9c1e<br>t=4$m=65536,<br>5c0e7b9d1f3a<br>b0d1e2a4c6f8<br>8enonce:4a6c<br>9b0d5f1a3c7e<br>4a6salt:7d2f<br>2idkdf:argon<br>f6d1b8e0a2c4<br>256::hmac-sha<br>7b0d9c1e3a5f<br>2mN$p=4$r8kL<br>32bvault_key:<br>2d1f6a8c0e2b<br>aesencrypted:<br>1b0d3e5a7c9f<br>dropzeroize::<br>b2d1a4f6c8e0<br>5b0d7f9a1c3e<br>256::hash:sha<br>0b1d2c4e6a8f<br>randpepper:r<br>6b1d8e0a2c4f<br>tes::iv:12by<br>3b0d5a7c9e1f<br>16b:gcm:tag:<br>e9b0d1f3a5c7<br>aes:key_wrap:</div>
+
+      <div class="hash-column" style="left: 500px; top: -20px;">d2e1b7c9a3f8<br>e1b4a68d9f2c<br>c9d7b31f8e5a<br>0e202da8c4f6<br>7a9c9ed5f1b3<br>12$LJkx$2b$3<br>0b1f8ae6d2c4<br>256:9f86dsha0<br>5f7a9b1d3e0c<br>on2id$v=arg19<br>e2a4f68c0b1d<br>56-gcm:aes-2:<br>9c1e3f7a5c0e<br>536,$m=6t=45<br>1f3a7b9d5c0e<br>c6f8e2a4b0d1<br>6c8enon4ace:<br>3c7e5f1a9b0d<br>2f4a6sal7dt:<br>gon2idkdf:ar<br>a2c4b8e0f6d1<br>sha256::hmac-<br>3a5f9c1e7b0d<br>8kL2mN$p4$r=<br>ey:32bvalt_k<br>0e2b6a8cd1f<br>pted:aesencry<br>7c9f3e5a1b0d<br>ze::dropzeroi<br>c8e0a4f6b2d1<br>1c3e7f9a5b0d<br>ha256::hash:s<br>6a8f2c4e0b1d<br>r:randpeppe<br>a2c4f8e06b1d<br>2bytes::iv:1<br>9e1f5a7c3b0d<br>tag:16b:gcm:<br>a5c7d1f3e9b0<br>wrap:aes:key_</div>
+
+      <div class="hash-column green" style="left: 660px; top: -15px;">e1b7a3f8c9d2<br>4a6f2c8d9e1b<br>7b3e5a1f8c9d<br>02d4f6a8c0e2<br>9e1b3d5f7a9c<br>lock_vault:ok<br>f8a2c4e6d0b1<br>attempt:3/10<br>1d3e5f7a9b0c<br>lockout:15min<br>8c0e2a4f6b1d<br>backoff:exp::<br>3f7a9c1e5b0d<br>delete_after4<br>7b9d1f3a5c0e<br>e2a4c6f8b0d1<br>pattern:6x6::<br>5f1a3c7e9b0d<br>cells:12_min:<br>b8e0a2c4f6d1<br>entropy:42bit<br>9c1e3a5f7b0d<br>totp::verify:<br>a4f6c8e0b2d1<br>qr_code::gen:<br>6a8c0e2b4d1f<br>import::csv::<br>3e5a7c9f1b0d<br>bitwarden:ok:<br>a4f6c8e0b2d1<br>1password:ok:<br>2c4e6a8f0b1d<br>lastpass:ok::<br>8e0a2c4f6b1d<br>usb::detect::<br>5a7c9e1f3b0d<br>backup::enc::<br>d1f3a5c7e9b0<br>checksum:sha2<br>7f9a1c3e5b0d</div>
+
+      <div class="hash-column dim" style="left: 820px; top: -25px;">f8c9d2a3e1b7<br>2c8d9e4a6f1b<br>5a1f8c7b3e9d<br>4f6a8c02d0e2<br>3d5f7a9e1b9c<br>$argon2id$v=<br>4e6d0bf8a2c1<br>9f86d0sha2:6<br>5f7a9b1d3e0c<br>19$m=19456,t<br>2a4f6b8c0e1d<br>=3,p=2$lowsl<br>a9c1e53f7b0d<br>mem:19mib:::<br>d1f3a57b9c0e<br>iter:3::para<br>c6f8b0e2a4d1<br>llel:2::hash<br>a3c7e9b5f10d<br>password_ok::<br>0a2c4f6b8ed1<br>pattern_ok:::<br>1e3a5f79c0bd<br>session:open:<br>6c8e0b2a4d1f<br>vault_unlock:<br>5a7c9e13fb0d<br>entries:ready<br>f3a5c7d1e9b0<br>clipboard:30s<br>1c3e5b7f9a0d<br>auto_lock:5m:<br>e6a8f02c4b1d<br>settings:save<br>2c4f68e0ab1d<br>atomic:write:<br>7c9e1f5a3b0d<br>rename:ok::::<br>3a5c7e9d1fb0<br>no_network:::</div>
+
+      <div class="hash-column" style="left: 980px; top: -8px;">b7a3f8c9e1d2<br>f2c8d9e14a6b<br>1f8c9d7b35ea<br>6a8c0e202d4f<br>5f7a9c9e1b3d<br>$2b$12$hash:<br>2c4e6d0b1f8a<br>sha256:digest<br>3e5f7a9b0c1d<br>argon2id:safe<br>0e2a4f6b1d8c<br>aes256:strong<br>7a9c1e5b0d3f<br>key:256bits::<br>9d1f3a5c0e7b<br>a4c6f8b0d1e2<br>nonce:unique:<br>1a3c7e9b0d5f<br>salt:persalt:<br>kdf:memoryhrd<br>e0a2c4f6d1b8<br>hmac:integrity<br>e3a5f7b0d9c1<br>zero_trust:::<br>c0e2b4d1f6a8<br>local_only:::<br>a7c9f1b0d3e5<br>rust:memorysf<br>f6c8e0b2d1a4<br>no_gc:determ:<br>9a1c3e5b0d7f<br>pure_rust::::<br>4e6a8f0b1d2c<br>cross_platfrm<br>0a2c4f6b1d8e<br>win:mac:linux<br>c9e1f3b0d5a7<br>open_source::<br>f3a5c7e9b0d1<br>mit_license::</div>
+
+      <div class="hash-column green" style="left: 1100px; top: -35px;">a3f8c9d2e1b7<br>4a6f2c8d9e1b<br>7b3e5a1f8c9d<br>02d4f6a8c0e2<br>9e1b3d5f7a9c<br>vault:secure:<br>f8a2c4e6d0b1<br>encrypt:ok:::<br>1d3e5f7a9b0c<br>decrypt:ok:::<br>8c0e2a4f6b1d<br>verify:pass::<br>3f7a9c1e5b0d<br>generate:pwd:<br>7b9d1f3a5c0e<br>entropy:high:<br>e2a4c6f8b0d1<br>strength:max:<br>5f1a3c7e9b0d<br>custom:fields<br>b8e0a2c4f6d1<br>tags:organize<br>9c1e3a5f7b0d<br>search:fast::<br>a4f6c8e0b2d1<br>filter:bytag:<br>6a8c0e2b4d1f<br>copy:safe::::<br>3e5a7c9f1b0d<br>clear:auto:::<br>a4f6c8e0b2d1<br>timeout:30s::<br>2c4e6a8f0b1d<br>lock:inactiv:<br>8e0a2c4f6b1d<br>shortcut:ctrl<br>5a7c9e1f3b0d<br>portable::::<br>d1f3a5c7e9b0<br>quickpass::::</div>
+    </div>
+
+    <!-- Main content -->
+    <div class="content">
+      <div class="lock-icon">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="12" y="28" width="40" height="30" rx="4" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+          <path d="M22 28V20C22 14.477 26.477 10 32 10C37.523 10 42 14.477 42 20V28" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+          <circle cx="32" cy="42" r="4" fill="#38bdf8"/>
+          <line x1="32" y1="46" x2="32" y2="51" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+      </div>
+
+      <div class="title">QuickPass</div>
+
+      <div class="tagline">
+        <span class="accent">Secure</span> local password manager built in <span class="accent">Rust</span>
+      </div>
+
+      <div class="features">
+        <div class="pill"><span class="icon">&#x1F512;</span> AES-256-GCM</div>
+        <div class="pill"><span class="icon">&#x1F511;</span> Argon2id</div>
+        <div class="pill"><span class="icon">&#x1F6E1;</span> Zero Network</div>
+        <div class="pill"><span class="icon">&#x2699;</span> Cross-Platform</div>
+      </div>
+    </div>
+
+    <div class="url">github.com/Technical-1/QuickPass</div>
+  </div>
+</body>
+</html>

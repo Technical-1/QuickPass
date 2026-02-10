@@ -183,3 +183,5 @@ I separated concerns into focused modules:
 2. **No Sync**: Each device maintains its own vaults (USB export provides manual transfer)
 3. **Platform Signing**: macOS/Windows binaries are unsigned, requiring manual trust approval
 4. **Single-User Design**: No multi-user or sharing features
+
+> **Note**: A modern UI rewrite ([QuickPass-v2](https://github.com/Technical-1/QuickPass-v2)) exists using Tauri v2 + React, but this original pure-Rust version provides stronger memory safety since passwords never leave the Rust runtime.

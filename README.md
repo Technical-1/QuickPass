@@ -1,6 +1,8 @@
 # QuickPass
 
-A secure, cross-platform desktop password manager built in Rust with eframe/egui.
+A secure, cross-platform desktop password manager built entirely in Rust with eframe/egui. Zero network access, zero JavaScript — all security-critical operations happen in memory-safe Rust with deterministic `zeroize` on Drop.
+
+> **Looking for the Tauri + React version?** See [QuickPass-v2](https://github.com/Technical-1/QuickPass-v2) — a modern UI rewrite with the same Rust backend.
 
 ## Features
 
@@ -13,6 +15,9 @@ A secure, cross-platform desktop password manager built in Rust with eframe/egui
 - **Auto-Lock**: Configurable inactivity timeout with clipboard auto-clear
 - **Brute-Force Protection**: Progressive lockouts with exponential backoff
 - **Tags & Search**: Organize entries with custom tags and filter by website/username
+- **Custom Fields**: Add flexible key-value fields (Text, Password, URL, Email, Notes) to any entry
+- **USB Portable Backup**: Export encrypted vault backups to removable drives with SHA-256 checksum verification
+- **Entropy Game**: Tic-Tac-Toe mini-game that collects interaction timing to supplement system RNG for password generation
 
 ## Security Model
 
@@ -118,6 +123,13 @@ cargo build --release
 - **Export CSV**: Export entries to CSV format
 - **Export Encrypted Backup**: Create encrypted backup file
 
+### USB Backup
+
+- **Detect USB Devices**: Automatically discovers removable drives
+- **Export to USB**: Creates encrypted `.quickpass_*.enc` backup files with SHA-256 checksums
+- **Import from USB**: Browse and restore from existing backups on any USB device
+- **Path Safety**: Blocks system directories, validates mount points, prevents path traversal
+
 ### Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -146,7 +158,7 @@ Files:
 ```bash
 cargo build              # Development build
 cargo build --release    # Release build
-cargo test               # Run all tests (100+ tests)
+cargo test               # Run all tests (109 tests)
 cargo run                # Run the application
 cargo clippy             # Run linter
 ```
@@ -164,8 +176,8 @@ cargo test password_tests::         # Run specific module tests
 ```
 
 **Test Categories:**
-- **Unit Tests** (~70 tests): Password generation, entropy calculation, encryption/decryption, validation
-- **Integration Tests** (~30 tests): Full workflows, import/export, security features
+- **Unit Tests** (78 tests): Password generation, entropy calculation, encryption/decryption, validation, settings, lockout, gamification, USB export
+- **Integration Tests** (31 tests): Full workflows, import/export, security features, Argon2 verification
 
 ### Quality Checks
 
@@ -215,15 +227,26 @@ The workflow is defined in `.github/workflows/build.yml` and includes:
 ### Project Structure
 
 ```
-src/
-├── main.rs       # Application entry point
-├── app.rs        # GUI application and state management
-├── vault.rs      # Encryption/decryption and vault operations
-├── security.rs   # Argon2id configuration and key derivation
-├── password.rs   # Password generation and entropy estimation
-├── manager.rs    # Vault file management and sanitization
-├── lockout.rs    # Brute-force protection system
-└── settings.rs   # Application configuration
+QuickPass/
+├── src/
+│   ├── main.rs           # Application entry point and window configuration
+│   ├── build.rs          # Build script (Windows icon/manifest via winres)
+│   ├── app.rs            # GUI application state machine and all screens (egui)
+│   ├── vault.rs          # Encryption/decryption, vault I/O, import/export, TOTP
+│   ├── security.rs       # Argon2id configuration and key derivation
+│   ├── password.rs       # Password generation and entropy estimation
+│   ├── manager.rs        # Vault file management and path sanitization
+│   ├── lockout.rs        # Brute-force protection with exponential backoff
+│   ├── settings.rs       # Persistent app settings (clipboard, auto-lock, max attempts)
+│   ├── gamification.rs   # Tic-Tac-Toe entropy collection game
+│   └── usb_export.rs     # USB device detection and portable encrypted backup
+├── tests/
+│   └── integration_tests.rs  # 31 integration tests
+├── .github/
+│   └── workflows/
+│       └── build.yml     # CI/CD: multi-platform build and release
+├── Cargo.toml            # Dependencies and build configuration
+└── README.md
 ```
 
 ## Architecture

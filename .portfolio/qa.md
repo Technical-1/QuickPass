@@ -72,7 +72,10 @@ Over 100 unit and integration tests covering encryption round-trips, CSV parsing
 **A:** After configurable failed attempts (3-10), the vault locks with exponential backoff (15min, 30min, 60min). After the 4th lockout period, the vault is deleted. An attacker gets limited attempts before losing access entirely.
 
 ### Q: Can I sync vaults between devices?
-**A:** Not automatically - this is intentional to avoid cloud dependencies. USB export creates encrypted backup files that can be manually transferred. I may add local network sync in future versions.
+**A:** Not automatically - this is intentional to avoid cloud dependencies. USB export creates encrypted backup files that can be manually transferred.
+
+### Q: Is there a version with a modern UI?
+**A:** Yes - [QuickPass-v2](https://github.com/Technical-1/QuickPass-v2) is a Tauri v2 + React rewrite with the same Rust backend modules but a modern web-based interface. This original version remains the pure-Rust implementation with stronger memory safety guarantees since passwords never cross an IPC boundary into JavaScript.
 
 ### Q: Why is the macOS binary unsigned?
 **A:** Apple Developer Program costs $99/year. For an open-source project, I've documented how to allow unsigned apps in macOS security settings instead.
