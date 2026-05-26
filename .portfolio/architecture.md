@@ -125,42 +125,42 @@ sequenceDiagram
 
 ### Design Philosophy
 
-I built QuickPass with a security-first mindset while maintaining usability. The architecture follows these key principles:
+QuickPass is built around three principles:
 
-1. **Defense in Depth**: Multiple layers of security protect user data - Argon2id for key derivation, AES-256-GCM for encryption, and zeroize for secure memory clearing.
+1. **Defense in Depth**: Multiple security layers protect user data — Argon2id for key derivation, AES-256-GCM for encryption, and `zeroize` for deterministic memory clearing.
 
-2. **Fail-Secure Design**: The lockout system progressively restricts access on failed attempts, eventually deleting vaults after too many failures to prevent brute-force attacks.
+2. **Fail-Secure Design**: The lockout system progressively restricts access on failed attempts, eventually deleting vaults after too many failures so a stolen vault file can't be ground offline indefinitely.
 
-3. **Minimal Trust Surface**: All sensitive operations happen locally. No network requests, no telemetry, no cloud sync.
+3. **Minimal Trust Surface**: All sensitive operations happen locally. No network requests, no telemetry, no cloud sync, no third-party dependencies for the security path.
 
 ### Key Architectural Decisions
 
 #### Dual Authentication System
-I implemented both master password and visual pattern unlock because:
-- Users can choose their preferred method based on context
-- Pattern provides visual/spatial memory alternative for users who struggle with passwords
-- The vault key is encrypted under both credentials, allowing either to unlock
+Both master password and visual pattern unlock are supported:
+- Either credential independently unlocks the vault
+- The pattern is a visual/spatial memory alternative for users who prefer it
+- The vault key is encrypted twice — once under each credential
 
 #### Per-Vault Random Salt
-Each vault gets its own cryptographically random salt rather than a global salt:
+Each vault has its own cryptographically random salt rather than a global salt:
 - Prevents rainbow table attacks across vaults
-- Isolates vault security - compromising one vault's salt doesn't help attack others
+- Compromising one vault's salt doesn't help attack others
 - Follows modern cryptographic best practices
 
 #### Vault Key Architecture
-Instead of directly encrypting vault data with the password-derived key:
+Rather than encrypting vault data directly with a password-derived key:
 - A random 32-byte vault key encrypts the actual data
-- This vault key is encrypted under both password and pattern
-- Changing password/pattern only requires re-encrypting the vault key, not all data
+- The vault key is encrypted under both password and pattern
+- Rotating a credential only re-encrypts the 32-byte key, not the entire vault
 
 #### Atomic File Writes
 All vault saves use a write-to-temp-then-rename pattern:
 - Prevents data corruption from interrupted writes
-- Ensures vault files are always in a valid state
+- Vault files are always in a valid state (either old or new, never partial)
 - Critical for a password manager where data loss is catastrophic
 
 #### Module Separation
-I separated concerns into focused modules:
+Concerns are split into focused modules:
 - `vault.rs`: Pure encryption/decryption logic
 - `security.rs`: Argon2id configuration isolated for easy auditing
 - `manager.rs`: File system operations with path sanitization
